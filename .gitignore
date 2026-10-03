@@ -9,9 +9,14 @@
 /out/
 /dist/
 /_deps/
+/x64/
+/Debug/
+/Release/
+/temp/
 
 # ─── Compiled C++ Artifacts ───────────────────────────────────
 *.exe
+*.bat
 *.obj
 *.o
 *.pdb
@@ -45,11 +50,16 @@ __pycache__/
 *.egg-info/
 dist/
 *.egg
+ecosystem.config.js
 
 # ─── Temporary IPC / UUID Files ───────────────────────────────
 request_*.json
 response_*.json
 *.tmp
+/runtime_state.json
+/wa_state.json
+/gemini_thinking.json
+/audit_logs/*.jsonl
 
 # ─── Log Files ────────────────────────────────────────────────
 *.log

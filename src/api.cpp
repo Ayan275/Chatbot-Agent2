@@ -35,7 +35,7 @@
 #endif
 
 namespace fs = std::filesystem;
-static constexpr int TIMEOUT_SECS = 90;
+static constexpr int TIMEOUT_SECS = 25;
 
 namespace {
 
@@ -125,7 +125,7 @@ static bool runPython(const fs::path& req, const fs::path& res, int timeout = TI
             cmdBuf.data(),    // lpCommandLine (mutable)
             nullptr, nullptr, // process/thread security
             FALSE,            // no handle inheritance
-            0,                // creation flags
+            CREATE_NO_WINDOW, // prevent a console window for the Python helper
             nullptr, nullptr, // environment / current directory (inherit)
             &si, &pi)) {
         Logger::log("ERROR", "CreateProcess failed: python subprocess could not be started");
@@ -182,8 +182,8 @@ static bool runPython(const fs::path& req, const fs::path& res, int timeout = TI
         pid_t r = waitpid(pid, &status, WNOHANG);
         if (r == pid)  { exited = true; break; }
         if (r < 0)     { break; }
-        // Sleep 200 ms before re-checking
-        struct timespec ts{0, 200'000'000L};
+        // Keep subprocess completion detection responsive without busy-waiting.
+        struct timespec ts{0, 25'000'000L};
         nanosleep(&ts, nullptr);
     }
 
@@ -218,7 +218,7 @@ std::string callAPI(nlohmann::json& history, const std::string& model, TokenUsag
             return "System Error: Local workspace directory is write-protected.";
         }
         try {
-            out << nlohmann::json{{"model", model}, {"messages", history}}.dump(4);
+            out << nlohmann::json{{"model", model}, {"messages", history}}.dump();
             if (!out.good()) {
                 Logger::log("ERROR", "Request file write failed");
                 fs::remove(reqFile);
@@ -389,7 +389,7 @@ void runWrongCommand(const std::string& severity) {
     PROCESS_INFORMATION pi{};
 
     if (!CreateProcessA(nullptr, cmdBuf.data(), nullptr, nullptr,
-                        FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                        FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
         Logger::log("ERROR", "runWrongCommand: CreateProcess failed");
         std::cout << "  [Error] Could not spawn correction handler process.\n";
         return;

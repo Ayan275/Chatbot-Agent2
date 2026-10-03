@@ -16,7 +16,7 @@ The C++ core manages all application state, IPC, and user interaction; Python ha
 - **Unified logger**: Thread-safe `Logger` utility writes ISO-8601 timestamped entries to `app.log` from all components.
 - **500-word response limit**: Replies are word-capped and Markdown-stripped for clean terminal output.
 - **Smart context management**: Retains only the last 10 exchanges (20 messages) to prevent API payload bloat and latency.
-- **Crash-proof IPC**: UUID v4 filenames for request/response JSON files prevent cross-session collisions; a 90-second subprocess kill timeout ensures the system can never hang.
+- **Crash-proof IPC**: UUID v4 filenames for request/response JSON files prevent cross-session collisions; a bounded subprocess timeout prevents the system from hanging.
 - **Memory safety**: All heap objects managed via `std::unique_ptr` — zero raw owning pointers.
 - **Input sanitisation**: Two-layer filtering (character-level + jailbreak pattern detection) before any message reaches the API.
 - **Session persistence**: Chat history saved to a per-user file with automatic rotation when size exceeds 1 MB.
@@ -48,6 +48,24 @@ cmake --build build
 ```
 
 > `nlohmann/json` is fetched automatically by CMake — no manual header installation required.
+
+## Docker (Linux)
+
+Build and run the container with WhatsApp and Gemini credentials supplied at
+runtime rather than embedded in the image:
+
+```sh
+docker build -t whatsapp-ai-agent .
+docker run --name whatsapp-bot \
+  -e WA_AGENT_TOKEN \
+  -e GEMINI_API_KEY \
+  -e CHATBOT_USER=Ayan \
+  whatsapp-ai-agent
+```
+
+The image builds the C++ chatbot with CMake/GCC and launches it through
+`whatsapp_agent.py`. Set `CHATBOT_EXE` to override the default
+`/app/chatbot_linux`.
 
 ---
 

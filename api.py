@@ -385,7 +385,13 @@ def _pick_model(requested: Optional[str]) -> str:
 
 def _to_gemini(messages: list[dict], media_parts=None):
     """OpenAI-style messages -> (system_instruction, Gemini REST contents)."""
-    system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+    system_parts = [m["content"] for m in messages if m["role"] == "system"]
+    system_parts.append(
+        "Answer directly; omit greetings and preambles. Be concise. "
+        "For steps, put each item on its own line with a blank line between items. "
+        "Put each technical step and equation on its own line. Preserve WhatsApp line breaks."
+    )
+    system = "\n\n".join(system_parts)
     contents: list[dict] = []
     for m in messages:
         if m["role"] == "system":
@@ -441,16 +447,18 @@ def _generate(model: str, key: str, system: str, contents: list, temperature: fl
     variants = [cache[model]] if model in cache else _thinking_variants(model)
     last = None
     for think in variants:
-        gen_cfg: dict = {"temperature": temperature}
+        gen_cfg: dict = {"temperature": temperature, "maxOutputTokens": 768}
         if think:
             gen_cfg["thinkingConfig"] = think
         body: dict = {"contents": contents, "generationConfig": gen_cfg}
         if system:
             body["systemInstruction"] = {"parts": [{"text": system}]}
+        connect_timeout = min(4.0, max(1.0, read_timeout / 3))
         r = requests.post(
             f"{GEMINI_URL}/models/{model}:generateContent",
             headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-            json=body, timeout=(10, max(5.0, read_timeout)))
+            json=body,
+            timeout=(connect_timeout, max(1.0, read_timeout - connect_timeout)))
         if r.status_code == 400 and think is not None and "think" in r.text.lower():
             log.info("[Gemini] %s rejected thinking=%s, trying next setting", model, think)
             last = r
@@ -462,8 +470,8 @@ def _generate(model: str, key: str, system: str, contents: list, temperature: fl
     return last
 
 
-def _call_gemini(model: str, system: str, contents: list, temperature: float = 0.2,
-                 budget_s: float = 70.0) -> tuple[str, dict]:
+def _call_gemini(model: str, system: str, contents: list, temperature: float = 0.1,
+                 budget_s: float = 15.0) -> tuple[str, dict]:
     """Call Gemini with 503-retry and automatic model fallback. Returns (text, usage)."""
     if requests is None:
         raise BridgeError("requests module not installed (run: python -m pip install requests)")
@@ -471,6 +479,7 @@ def _call_gemini(model: str, system: str, contents: list, temperature: float = 0
     if not key:
         raise BridgeError("GEMINI_API_KEY environment variable not set")
 
+    budget_s = min(budget_s, 15.0)
     t0 = time.monotonic()
     deadline = t0 + budget_s
     last_msg = "Gemini request failed."
@@ -481,7 +490,7 @@ def _call_gemini(model: str, system: str, contents: list, temperature: float = 0
             if remaining < 3:
                 break
             try:
-                r = _generate(name, key, system, contents, temperature, min(30.0, remaining))
+                r = _generate(name, key, system, contents, temperature, remaining)
             except requests.exceptions.Timeout:
                 last_msg = "API Request Timed Out."
                 log.warning("[Gemini] %s timed out", name)
@@ -522,7 +531,7 @@ def _call_gemini(model: str, system: str, contents: list, temperature: float = 0
             if r.status_code in (401, 403) or "api_key_invalid" in r.text.lower():
                 raise BridgeError(last_msg)         # no point trying other models with a bad key
             if r.status_code in (500, 502, 503, 504):
-                time.sleep(2)
+                time.sleep(0.25)
                 continue                            # temporary overload: retry once
             break                                   # 404 / 429 / other: next model
 
@@ -530,7 +539,7 @@ def _call_gemini(model: str, system: str, contents: list, temperature: float = 0
 
 
 def run_turn(messages: list[dict], model: Optional[str] = None, media_parts=None,
-             temperature: float = 0.2, budget_s: float = 70.0) -> tuple[str, dict]:
+             temperature: float = 0.1, budget_s: float = 15.0) -> tuple[str, dict]:
     """
     One full chatbot turn: history pruning -> self-correction enforcement ->
     Gemini call -> runtime_state.json save.  Used by main() (C++ subprocess path)
@@ -594,7 +603,7 @@ def main(request_file: str, response_file: str) -> int:
 
     try:
         text, usage = run_turn(data["messages"], model=data.get("model"),
-                               temperature=data.get("temperature", 0.2))
+                               temperature=data.get("temperature", 0.1))
     except BridgeError as exc:
         write_error(response_file, str(exc)); return 1
 

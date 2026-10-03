@@ -8,10 +8,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Dependency Management: FetchContent for nlohmann/json
 include(FetchContent)
 set(JSON_BuildTests OFF CACHE INTERNAL "")
+if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+endif()
 FetchContent_Declare(
     json
     URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(json)
 
@@ -27,6 +29,9 @@ set(SHARED_SOURCES
 
 add_executable(chatbot src/main.cpp ${SHARED_SOURCES})
 target_include_directories(chatbot PRIVATE include)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set_target_properties(chatbot PROPERTIES OUTPUT_NAME chatbot_linux)
+endif()
 
 # Link against nlohmann_json
 target_link_libraries(chatbot PRIVATE nlohmann_json::nlohmann_json)
