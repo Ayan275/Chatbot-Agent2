@@ -17,6 +17,7 @@ Optional: CHATBOT_EXE (full path to chatbot binary), GEMINI_MODEL
 Disabled over WhatsApp: /exit, exit, /changepassword (they need the terminal).
 """
 import os, io, re, sys, json, time, queue, asyncio, logging, tempfile, threading, subprocess
+import hashlib, secrets
 from pathlib import Path
 import requests, edge_tts
 
@@ -80,14 +81,30 @@ class ChatbotProc:
                 return
 
     def _start(self):
-        env = dict(os.environ, PYTHONIOENCODING="utf-8")
-        self.q = queue.Queue()
-        self.proc = subprocess.Popen([str(self.exe), "--agent", self.user], cwd=str(BASE_DIR),
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, env=env, bufsize=0)
-        threading.Thread(target=self._pump, args=(self.proc, self.q), daemon=True).start()
-        banner = self._read_ready(60)
-        log.info("chatbot started: %s", (banner.strip().splitlines() or ["?"])[-1])
+        for attempt in range(2):
+            env = dict(os.environ, PYTHONIOENCODING="utf-8")
+            self.q = queue.Queue()
+            self.proc = subprocess.Popen([str(self.exe), "--agent", self.user], cwd=str(BASE_DIR),
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, env=env, bufsize=0)
+            threading.Thread(target=self._pump, args=(self.proc, self.q), daemon=True).start()
+            try:
+                banner = self._read_ready(60)
+            except ChatbotDied as exc:
+                if attempt or "unknown user" not in str(exc).lower():
+                    raise
+                try:
+                    _ensure_user_profile(self.user)
+                except (OSError, RuntimeError, ValueError) as init_error:
+                    raise ChatbotDied(
+                        f"Could not initialize user profile '{self.user}': {init_error}"
+                    ) from init_error
+                log.warning("Provisioned missing user profile '%s'; retrying chatbot startup", self.user)
+                continue
+            log.info("chatbot started: %s", (banner.strip().splitlines() or ["?"])[-1])
+            return
+
+        raise ChatbotDied(f"Could not initialize chatbot user '{self.user}'.")
 
     def _kill(self):
         try:
@@ -157,6 +174,62 @@ def find_user() -> str:
         return names[0]
     sys.exit("Set CHATBOT_USER to one of your chatbot users: " + (", ".join(names) or "(none found in users.json)")
              + '\n  PowerShell:  $env:CHATBOT_USER="Ayan"')
+
+
+def _ensure_user_profile(username: str) -> None:
+    """Create an auth-compatible, non-interactive profile if an old binary requires it."""
+    if not re.fullmatch(r"[A-Za-z0-9 -]{1,50}", username):
+        raise ValueError("Configured chatbot username contains unsupported characters.")
+
+    users_path = BASE_DIR / "users.json"
+    lock_path = BASE_DIR / ".users.json.lock"
+    deadline = time.monotonic() + 10
+    lock_fd = None
+    while lock_fd is None:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Timed out waiting for the user registry lock.")
+            time.sleep(0.05)
+
+    try:
+        if users_path.exists():
+            try:
+                with users_path.open("r", encoding="utf-8") as user_file:
+                    users = json.load(user_file)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError("Cannot read the user registry; refusing to overwrite it.") from exc
+            if not isinstance(users, list):
+                raise RuntimeError("User registry must be a JSON array; refusing to overwrite it.")
+        else:
+            users = []
+
+        if any(isinstance(entry, dict) and entry.get("username") == username for entry in users):
+            return
+
+        salt = secrets.token_hex(16)
+        password = secrets.token_urlsafe(48)
+        now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        users.append({
+            "username": username,
+            "password_hash": hashlib.sha256((salt + password).encode("utf-8")).hexdigest(),
+            "salt": salt,
+            "created_at": now,
+            "last_login": now,
+        })
+
+        temp_path = users_path.with_name(f"{users_path.name}.{os.getpid()}.tmp")
+        try:
+            with temp_path.open("w", encoding="utf-8") as user_file:
+                json.dump(users, user_file, indent=2)
+                user_file.write("\n")
+            os.replace(temp_path, users_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+    finally:
+        os.close(lock_fd)
+        lock_path.unlink(missing_ok=True)
 
 
 bot: ChatbotProc  # created in main()
@@ -375,7 +448,12 @@ def save_state(st):
 def main():
     global bot
     bot = ChatbotProc(find_exe(), find_user())
-    bot.ask("/help")      # start the chatbot now so the first real message is not slow; also proves login works
+    try:
+        bot.ask("/help")  # Starts agent mode, which provisions a missing user non-interactively.
+    except ChatbotDied as exc:
+        log.critical("Chatbot failed to initialize user '%s': %s", bot.user, exc)
+        bot.close()
+        raise SystemExit(f"Chatbot startup failed for configured user '{bot.user}'.") from exc
     st = load_state()
     handled = set(st["handled"])
     log.info("WhatsApp agent started (user=%s, exe=%s, offset=%s)", bot.user, bot.exe.name, st["offset"])

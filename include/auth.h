@@ -8,6 +8,7 @@ std::string getPasswordInput(const std::string& prompt = "Password: ");
 class Auth {
 public:
     bool registerUser(const std::string& username, const std::string& password);
+    bool ensureAgentUser(const std::string& username);
     bool loginUser(const std::string& username, const std::string& password);
     bool changePassword(const std::string& username, const std::string& currentPassword, const std::string& newPassword);
     bool userExists(const std::string& username);

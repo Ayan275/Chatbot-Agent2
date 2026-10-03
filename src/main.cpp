@@ -236,11 +236,10 @@ int main(int argc, char** argv) {
 
         std::string name;
         if (agentMode) {
-            // Trusted local front-end (WhatsApp agent): log in an EXISTING user without a password.
+            // Trusted local front-end (WhatsApp agent): provision missing profile without prompting.
             agentUser = sanitize(agentUser, cfg.maxNameLength, true);
-            if (agentUser.empty() || !auth.userExists(agentUser)) {
-                std::cout << "Agent mode: unknown user '" << agentUser
-                          << "'. Register this user once in the normal terminal first.\n";
+            if (agentUser.empty() || !auth.ensureAgentUser(agentUser)) {
+                std::cerr << "Agent mode: unable to initialize user profile.\n";
                 return 1;
             }
             name = agentUser;

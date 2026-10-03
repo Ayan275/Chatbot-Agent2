@@ -126,7 +126,14 @@ std::string getPasswordInput(const std::string& prompt) {
 }
 
 std::string Auth::usersFilePath() {
-    return (projectRoot() / "users.json").string();
+    const auto workingDirectory = std::filesystem::current_path();
+    const auto workingUsersFile = workingDirectory / "users.json";
+    if (std::filesystem::exists(workingUsersFile)) return workingUsersFile.string();
+
+    const auto sourceUsersFile = projectRoot() / "users.json";
+    if (std::filesystem::exists(sourceUsersFile)) return sourceUsersFile.string();
+    if (std::filesystem::exists(workingDirectory / "config.json")) return workingUsersFile.string();
+    return sourceUsersFile.string();
 }
 
 std::string Auth::timestampNow() {
@@ -202,6 +209,50 @@ bool Auth::registerUser(const std::string& username, const std::string& password
     users.push_back(entry);
 
     return writeUsersFileAtomic(path, users);
+}
+
+bool Auth::ensureAgentUser(const std::string& username) {
+    if (username.empty()) return false;
+
+    const std::string path = usersFilePath();
+    if (std::filesystem::exists(path)) {
+        std::ifstream in(path);
+        if (!in.is_open()) {
+            Logger::log("ERROR", "Auth: cannot read user registry while provisioning agent");
+            return false;
+        }
+        try {
+            nlohmann::json users;
+            in >> users;
+            if (!users.is_array()) {
+                Logger::log("ERROR", "Auth: user registry is not an array; refusing agent provisioning");
+                return false;
+            }
+            for (const auto& entry : users) {
+                if (entry.is_object() && entry.contains("username") &&
+                    entry["username"].is_string() &&
+                    entry["username"].get<std::string>() == username) {
+                    return true;
+                }
+            }
+        } catch (const std::exception& e) {
+            Logger::log("ERROR", std::string("Auth: invalid user registry; refusing agent provisioning: ") + e.what());
+            return false;
+        }
+    }
+
+    static constexpr char PASSWORD_CHARS[] =
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    std::random_device random;
+    std::uniform_int_distribution<size_t> select(0, sizeof(PASSWORD_CHARS) - 2);
+    std::string password;
+    password.reserve(64);
+    for (size_t i = 0; i < 64; ++i) {
+        password.push_back(PASSWORD_CHARS[select(random)]);
+    }
+
+    if (registerUser(username, password)) return true;
+    return userExists(username);
 }
 
 bool Auth::loginUser(const std::string& username, const std::string& password) {
