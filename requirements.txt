@@ -1,0 +1,7 @@
+requests>=2.31.0
+edge-tts
+python-docx
+flask
+gunicorn
+requests
+python-dotenv

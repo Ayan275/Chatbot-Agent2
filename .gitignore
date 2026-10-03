@@ -1,0 +1,86 @@
+# =============================================================
+#  AI Chatbot Project — .gitignore
+#  Covers: C++/MinGW/MSVC builds, Python, IPC temp files
+# =============================================================
+
+# ─── Build & Output Directories ───────────────────────────────
+/build/
+/bin/
+/out/
+/dist/
+/_deps/
+
+# ─── Compiled C++ Artifacts ───────────────────────────────────
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.a
+*.so
+*.dylib
+
+# ─── CMake Cache & Generated Files ────────────────────────────
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+build.ninja
+.ninja_deps
+.ninja_log
+install_manifest.txt
+
+# ─── Python Environments & Cache ──────────────────────────────
+venv/
+.venv/
+env/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+*.egg
+
+# ─── Temporary IPC / UUID Files ───────────────────────────────
+request_*.json
+response_*.json
+*.tmp
+
+# ─── Log Files ────────────────────────────────────────────────
+*.log
+app.log
+api.log
+
+# ─── Session / Export Files ───────────────────────────────────
+chat_*.txt
+export_*.md
+
+# ─── Secrets & Environment Variables ──────────────────────────
+.env
+.env.*
+*.key
+secrets.json
+
+# ─── IDE & Editor Directories ─────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln.docstates
+.vs/
+
+# ─── OS-Specific Files ────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── MinGW / MSVC Specific ────────────────────────────────────
+*.d
+*.gcda
+*.gcno
+*.map
