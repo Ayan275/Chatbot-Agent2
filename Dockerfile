@@ -44,7 +44,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # --- Python dependencies ---
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python3 --version \
+    && pip install --no-cache-dir -r requirements.txt \
+    && python3 -c "import PIL, google.generativeai"
 
 # --- Application files ---
 COPY --from=cpp-builder /tmp/chatbot-build/chatbot_linux ./chatbot_linux

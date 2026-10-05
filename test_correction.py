@@ -6,12 +6,15 @@ import json
 import os
 import tempfile
 import unittest
+import base64
+import io
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 import api
+from PIL import Image
 from self_correction_chatbot import ChatbotApp
 
 
@@ -161,6 +164,36 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
         api._refresh_corrections_cache()
 
         self.assertEqual(api.CORRECTIONS_CACHE["what is python"], "old answer")
+
+    def test_media_part_validates_image_bytes_and_local_path(self) -> None:
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), color="red").save(image_buffer, format="PNG")
+        image_bytes = image_buffer.getvalue()
+
+        encoded = api.media_part(image_bytes, "image/png")["inline_data"]["data"]
+        self.assertEqual(base64.b64decode(encoded), image_bytes)
+
+        image_path = Path(self.temp_dir.name) / "image.png"
+        image_path.write_bytes(image_bytes)
+        path_payload = api.media_part(image_path, "image/png")["inline_data"]["data"]
+        self.assertEqual(base64.b64decode(path_payload), image_bytes)
+
+        with self.assertRaises(api.BridgeError):
+            api.media_part(b"not an image", "image/png")
+
+    def test_main_returns_error_json_with_success_exit_status(self) -> None:
+        request_path = Path(self.temp_dir.name) / "request.json"
+        response_path = Path(self.temp_dir.name) / "response.json"
+        request_path.write_text(json.dumps({
+            "model": "gemini-test",
+            "messages": [{"role": "user", "content": "describe this image"}],
+        }), encoding="utf-8")
+
+        with patch.object(api, "run_turn", side_effect=api.BridgeError("Invalid image payload.")):
+            self.assertEqual(api.main(str(request_path), str(response_path)), 0)
+
+        self.assertEqual(json.loads(response_path.read_text(encoding="utf-8")),
+                         {"error": "Invalid image payload."})
 
 
 if __name__ == "__main__":

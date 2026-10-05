@@ -24,6 +24,7 @@
 #include <random>
 #include <filesystem>
 #include <vector>
+#include <cstdlib>
 
 #ifdef _WIN32
   #include <windows.h>

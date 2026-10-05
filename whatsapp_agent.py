@@ -349,15 +349,27 @@ def transcribe(data: bytes, mime: str) -> str:
                          "script. Output only the transcript, nothing else."}], MEDIA_BUDGET)
 
 
-def digest(kind: str, data: bytes = None, mime: str = None, text: str = None) -> str:
-    if kind == "image":
-        ask = ("Describe this image concisely: what it shows, any visible text, and key details. "
-               "Plain text only, no markdown, at most 800 characters.")
-    else:
-        ask = ("Summarise this document: topic, key points, important numbers, names and dates. "
-               "Plain text only, no markdown, at most 1000 characters.")
-    first = gemini.media_part(data, mime) if data is not None else {"text": text}
-    return gem([first, {"text": ask}], MEDIA_BUDGET)
+def digest(kind: str, data: bytes | str | os.PathLike | None = None,
+           mime: str | None = None, text: str | None = None) -> str:
+    try:
+        if kind == "image":
+            if data is None:
+                raise ValueError("Image payload is missing.")
+            mime = mime or "image/jpeg"
+            if not mime.lower().startswith("image/"):
+                raise ValueError("Image payload has an invalid MIME type.")
+            ask = ("Describe this image concisely: what it shows, any visible text, and key details. "
+                   "Plain text only, no markdown, at most 800 characters.")
+        else:
+            ask = ("Summarise this document: topic, key points, important numbers, names and dates. "
+                   "Plain text only, no markdown, at most 1000 characters.")
+        media_mime = mime or ("image/jpeg" if kind == "image" else "application/octet-stream")
+        first = gemini.media_part(data, media_mime) if data is not None else {"text": text}
+        return gem([first, {"text": ask}], MEDIA_BUDGET)
+    except Exception as exc:
+        if kind == "image":
+            raise RuntimeError("Image payload could not be prepared or sent to Gemini Vision.") from exc
+        raise
 
 
 def docx_text(data):

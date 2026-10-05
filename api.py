@@ -31,6 +31,7 @@ UUID-named temp files (passed in from C++) prevent concurrent-session collisions
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import os
@@ -170,7 +171,7 @@ log.info("api.py startup — runtime_state_path=%s", RUNTIME_STATE_PATH)
 # Utility helpers
 # ===========================================================================
 
-def write_error(path: str, message: str) -> None:
+def write_error(path: str, message: str) -> bool:
     """Write a JSON error payload to the response file and log it."""
     try:
         response_path = Path(path)
@@ -178,8 +179,10 @@ def write_error(path: str, message: str) -> None:
         with open(response_path, "w", encoding="utf-8") as fh:
             json.dump({"error": message}, fh)
         log.error("Error response written: %s", message)
+        return True
     except OSError as exc:
         log.critical("Cannot write error response to %s: %s", path, exc)
+        return False
 
 
 def validate_payload(data: object) -> Optional[str]:
@@ -371,9 +374,58 @@ class BridgeError(Exception):
     """User-presentable failure; the message is shown in the C++ console / WhatsApp."""
 
 
-def media_part(data: bytes, mime: str) -> dict:
+def _media_bytes(data: object, mime: str) -> bytes:
+    """Load bytes or an allowed local path and validate image payloads before upload."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        payload = bytes(data)
+    elif isinstance(data, (str, os.PathLike)):
+        candidate = Path(data).expanduser()
+        allowed_roots = (Path("/tmp").resolve(), BASE_DIR.resolve(), Path.cwd().resolve())
+        candidates = (candidate,) if candidate.is_absolute() else (BASE_DIR / candidate, Path.cwd() / candidate)
+        resolved = None
+        for path in candidates:
+            try:
+                path = path.resolve(strict=True)
+            except (OSError, RuntimeError):
+                continue
+            if any(path == root or root in path.parents for root in allowed_roots):
+                resolved = path
+                break
+        if resolved is None or not resolved.is_file():
+            raise BridgeError("Media file path must resolve to a file in /tmp or the application directory.")
+        try:
+            if resolved.stat().st_size > 20 * 1024 * 1024:
+                raise BridgeError("Media file exceeds the 20 MB upload limit.")
+            payload = resolved.read_bytes()
+        except OSError as exc:
+            raise BridgeError("Media file could not be read.") from exc
+    else:
+        raise BridgeError("Media payload must be bytes or a local file path.")
+
+    if not payload:
+        raise BridgeError("Media payload is empty.")
+    if len(payload) > 20 * 1024 * 1024:
+        raise BridgeError("Media payload exceeds the 20 MB upload limit.")
+    if mime.lower().startswith("image/"):
+        try:
+            from PIL import Image
+
+            with Image.open(io.BytesIO(payload)) as image:
+                image.verify()
+        except Exception as exc:
+            raise BridgeError("Image payload is not a valid or supported image.") from exc
+    return payload
+
+
+def media_part(data: object, mime: str) -> dict:
     """Inline image / PDF / audio part (REST format) for run_turn(media_parts=...)."""
-    return {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}}
+    try:
+        payload = _media_bytes(data, mime)
+        return {"inline_data": {"mime_type": mime, "data": base64.b64encode(payload).decode("ascii")}}
+    except BridgeError:
+        raise
+    except Exception as exc:
+        raise BridgeError("Media payload could not be prepared for Gemini.") from exc
 
 
 def _pick_model(requested: Optional[str]) -> str:
@@ -608,17 +660,17 @@ def main(request_file: str, response_file: str) -> int:
             data = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
         log.error("Cannot read request: %s", exc)
-        write_error(response_file, "System Error: Failed to read session request payload."); return 1
+        return 0 if write_error(response_file, "System Error: Failed to read session request payload.") else 1
 
     err = validate_payload(data)
     if err:
-        write_error(response_file, f"Invalid payload: {err}"); return 1
+        return 0 if write_error(response_file, f"Invalid payload: {err}") else 1
 
     try:
         text, usage = run_turn(data["messages"], model=data.get("model"),
                                temperature=data.get("temperature", 0.1))
     except BridgeError as exc:
-        write_error(response_file, str(exc)); return 1
+        return 0 if write_error(response_file, str(exc)) else 1
 
     # Same shape the C++ side already parses (OpenAI-style): choices[0].message.content + usage
     result = {
@@ -651,5 +703,4 @@ if __name__ == "__main__":
         sys.exit(130)
     except Exception as exc:
         log.exception("Unhandled exception in api.py main()")
-        write_error(res_file, "System Error: An unexpected error occurred inside the API bridge.")
-        sys.exit(1)
+        sys.exit(0 if write_error(res_file, "System Error: An unexpected error occurred inside the API bridge.") else 1)
