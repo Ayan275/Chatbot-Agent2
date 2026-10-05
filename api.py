@@ -356,9 +356,13 @@ def _save_runtime_state(user_query: str, bot_response: str) -> None:
 # Core API bridge  (Gemini)
 # ===========================================================================
 
-DEFAULT_MODEL = "gemini-3.8-flash"
+# gemini-2.0-flash is the fastest production-grade model as of 2025.
+# Override at runtime with GEMINI_MODEL env var (e.g. gemini-1.5-flash-8b for even lower latency).
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 FALLBACK_MODELS = [m.strip() for m in os.getenv(
-    "GEMINI_FALLBACKS", "gemini-3.7-flash,gemini-3-flash-preview,gemini-2.5-flash").split(",") if m.strip()]
+    "GEMINI_FALLBACKS",
+    "gemini-1.5-flash,gemini-1.5-flash-8b,gemini-2.5-flash"
+).split(",") if m.strip()]
 GEMINI_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
 THINK_CACHE_PATH: Path = BASE_DIR / "gemini_thinking.json"   # remembers which thinking setting each model accepts
 
@@ -386,10 +390,13 @@ def _pick_model(requested: Optional[str]) -> str:
 def _to_gemini(messages: list[dict], media_parts=None):
     """OpenAI-style messages -> (system_instruction, Gemini REST contents)."""
     system_parts = [m["content"] for m in messages if m["role"] == "system"]
+    # Ultra-terse instruction: eliminates preamble, greetings, and padding.
+    # This is the single biggest latency win — fewer output tokens = faster response.
     system_parts.append(
-        "Answer directly; omit greetings and preambles. Be concise. "
-        "For steps, put each item on its own line with a blank line between items. "
-        "Put each technical step and equation on its own line. Preserve WhatsApp line breaks."
+        "Reply in the same language the user wrote in. "
+        "Be direct and concise — no greetings, no preamble, no sign-offs. "
+        "For numbered steps, put each on its own line. "
+        "For WhatsApp: use plain text, no markdown headers (#), keep paragraphs short."
     )
     system = "\n\n".join(system_parts)
     contents: list[dict] = []
@@ -417,14 +424,18 @@ def _friendly_status(status: int, body: str) -> str:
 
 
 def _thinking_variants(model: str) -> list:
-    """Low-latency 'thinking' settings to try, best first. None = model default.
+    """Thinking settings to try. Flash models disable thinking entirely for minimum latency.
     Unsupported variants get a 400 and we fall through (the working one is cached on disk)."""
     if os.getenv("GEMINI_THINKING", "").lower() == "default":
         return [None]
     m = model.lower()
-    if "2.5" in m or "2.0" in m:
+    # All flash variants: disable thinking — saves 2-4s per call.
+    if "flash" in m:
         return [{"thinkingBudget": 0}, None]
-    return [{"thinkingLevel": "minimal"}, {"thinkingLevel": "low"}, None]
+    # Pro/experimental models: try minimal thinking first, then model default.
+    if "2.5" in m or "2.0" in m or "pro" in m:
+        return [{"thinkingBudget": 0}, None]
+    return [None]
 
 
 def _load_think_cache() -> dict:
@@ -447,7 +458,9 @@ def _generate(model: str, key: str, system: str, contents: list, temperature: fl
     variants = [cache[model]] if model in cache else _thinking_variants(model)
     last = None
     for think in variants:
-        gen_cfg: dict = {"temperature": temperature, "maxOutputTokens": 768}
+        # 512 tokens covers ~380 words — enough for any WhatsApp reply.
+        # Keeping this tight is the second-biggest latency win after model selection.
+        gen_cfg: dict = {"temperature": temperature, "maxOutputTokens": 512}
         if think:
             gen_cfg["thinkingConfig"] = think
         body: dict = {"contents": contents, "generationConfig": gen_cfg}

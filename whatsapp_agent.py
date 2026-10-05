@@ -42,10 +42,11 @@ BASE = "https://api.whatsapp.com/agent/v1"
 HTTP = requests.Session()
 HDR = {"Authorization": f"Bearer {os.environ['WA_AGENT_TOKEN']}"}
 STATE_FILE = BASE_DIR / "wa_state.json"
-OK_AUDIO = ("audio/ogg", "audio/mpeg", "audio/aac", "audio/wav", "audio/flac")
+OK_AUDIO = ("audio/ogg", "audio/mpeg", "audio/aac", "audio/wav", "audio/flac", "audio/opus", "audio/ogg; codecs=opus")
 BLOCKED_CMDS = ("/exit", "exit", "/changepassword")
 MAX_LINE = 1900            # chatbot hard limit is 2000 characters per message
 TURN_TIMEOUT = 40          # C++ API bridge has a 25 s hard timeout
+MEDIA_BUDGET = 30          # seconds budget for Gemini vision / audio calls (slower than text)
 
 log = logging.getLogger("wa_agent")
 log.setLevel(logging.INFO)
@@ -82,7 +83,10 @@ class ChatbotProc:
 
     def _start(self):
         for attempt in range(2):
-            env = dict(os.environ, PYTHONIOENCODING="utf-8")
+            # Propagate PYTHON_EXECUTABLE so the C++ binary uses python3 on Linux/Docker.
+            env = dict(os.environ,
+                       PYTHONIOENCODING="utf-8",
+                       PYTHON_EXECUTABLE=os.environ.get("PYTHON_EXECUTABLE", "python3"))
             self.q = queue.Queue()
             self.proc = subprocess.Popen([str(self.exe), "--agent", self.user], cwd=str(BASE_DIR),
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -322,22 +326,38 @@ def gem(parts, budget=15):
     return text.strip()
 
 
-def transcribe(data, mime):
-    mime = mime if mime in OK_AUDIO else "audio/ogg"
-    return gem([gemini.media_part(data, mime),
+_GEMINI_AUDIO_MIMES = {"audio/ogg", "audio/mpeg", "audio/aac", "audio/wav", "audio/flac", "audio/opus"}
+
+
+def _normalise_audio_mime(mime: str) -> str:
+    """Map WhatsApp audio MIME variants to a type Gemini accepts.
+    WhatsApp sends 'audio/ogg; codecs=opus' or bare 'audio/opus';
+    Gemini's inline_data accepts 'audio/ogg' for OGG/Opus streams."""
+    m = mime.split(";")[0].strip().lower()
+    if m in ("audio/opus", "audio/ogg"):
+        return "audio/ogg"
+    if m in _GEMINI_AUDIO_MIMES:
+        return m
+    return "audio/ogg"  # safe fallback for unknown WhatsApp audio types
+
+
+def transcribe(data: bytes, mime: str) -> str:
+    """Send audio bytes to Gemini for transcription. Always uses normalised MIME."""
+    norm_mime = _normalise_audio_mime(mime)
+    return gem([gemini.media_part(data, norm_mime),
                 {"text": "Transcribe this voice note exactly as spoken, in the original language and "
-                         "script. Output only the transcript."}], 40)
+                         "script. Output only the transcript, nothing else."}], MEDIA_BUDGET)
 
 
-def digest(kind, data=None, mime=None, text=None):
+def digest(kind: str, data: bytes = None, mime: str = None, text: str = None) -> str:
     if kind == "image":
-        ask = ("Describe this image in detail and transcribe any visible text. "
-               "Plain text only, no markdown, at most 1200 characters.")
+        ask = ("Describe this image concisely: what it shows, any visible text, and key details. "
+               "Plain text only, no markdown, at most 800 characters.")
     else:
-        ask = ("Summarise this document faithfully: topic, key points, important numbers, names and dates. "
-               "Plain text only, no markdown, at most 1500 characters.")
+        ask = ("Summarise this document: topic, key points, important numbers, names and dates. "
+               "Plain text only, no markdown, at most 1000 characters.")
     first = gemini.media_part(data, mime) if data is not None else {"text": text}
-    return gem([first, {"text": ask}])
+    return gem([first, {"text": ask}], MEDIA_BUDGET)
 
 
 def docx_text(data):
@@ -355,12 +375,16 @@ def pick_voice(text):
 
 def tts(text):
     text = text[:1000]
-    path = tempfile.mktemp(suffix=".mp3")
-    asyncio.run(edge_tts.Communicate(text, pick_voice(text)).save(path))
+    fd, path = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd)
     try:
+        asyncio.run(edge_tts.Communicate(text, pick_voice(text)).save(path))
         return open(path, "rb").read()
     finally:
-        os.remove(path)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 # ---------- handler ----------
@@ -382,8 +406,13 @@ def handle(msg):
         line = txt if txt.startswith("/") else safe(txt)
 
     elif t == "audio":
-        data, mime = download(msg["audio"]["id"])
-        heard = safe(transcribe(data, mime))
+        try:
+            data, mime = download(msg["audio"]["id"])
+            heard = safe(transcribe(data, mime))
+        except Exception as e:
+            log.error("audio processing failed: %s", e)
+            send_text(to, "Awaaz process nahi ho saki. Dobara try karo.")
+            return
         log.info("transcript: %s", heard)
         if not heard:
             send_text(to, "Awaaz samajh nahi aayi, dobara bolo?")
@@ -391,25 +420,36 @@ def handle(msg):
         line, voice = heard, True
 
     elif t == "image":
-        data, mime = download(msg["image"]["id"])
-        cap = safe(msg["image"].get("caption") or "Is image ki summary do", 300)
-        line = safe(f"{cap} [Attached image: {safe(digest('image', data, mime or 'image/jpeg'), 1500)}]")
+        try:
+            data, mime = download(msg["image"]["id"])
+            cap = safe(msg["image"].get("caption") or "Is image ki summary do", 300)
+            desc = safe(digest("image", data, mime or "image/jpeg"), 1500)
+            line = safe(f"{cap} [Attached image: {desc}]")
+        except Exception as e:
+            log.error("image processing failed: %s", e)
+            send_text(to, "Image process nahi ho saki. Dobara bhejo ya text mein batao.")
+            return
 
     elif t == "document":
-        d = msg["document"]
-        data, mime = download(d["id"])
-        name = d.get("filename", "document")
-        cap = safe(d.get("caption") or "Is document ki summary do: key points aur action items", 300)
-        if mime == "application/pdf":
-            dg = digest("doc", data, mime)
-        elif mime == "text/plain":
-            dg = digest("doc", text=data.decode("utf-8", "ignore")[:60_000])
-        elif name.lower().endswith(".docx"):
-            dg = digest("doc", text=docx_text(data)[:60_000])
-        else:
-            send_text(to, f"'{name}' ka format summarise nahi kar sakta. PDF, TXT ya DOCX bhejo.")
+        try:
+            d = msg["document"]
+            data, mime = download(d["id"])
+            name = d.get("filename", "document")
+            cap = safe(d.get("caption") or "Is document ki summary do: key points aur action items", 300)
+            if mime == "application/pdf":
+                dg = digest("doc", data, mime)
+            elif mime == "text/plain":
+                dg = digest("doc", text=data.decode("utf-8", "ignore")[:60_000])
+            elif name.lower().endswith(".docx"):
+                dg = digest("doc", text=docx_text(data)[:60_000])
+            else:
+                send_text(to, f"'{name}' ka format summarise nahi kar sakta. PDF, TXT ya DOCX bhejo.")
+                return
+            line = safe(f"{cap} [Attached document {safe(name, 60)}: {safe(dg, 1500)}]")
+        except Exception as e:
+            log.error("document processing failed: %s", e)
+            send_text(to, "Document process nahi ho saka. Dobara bhejo ya text mein batao.")
             return
-        line = safe(f"{cap} [Attached document {safe(name, 60)}: {safe(dg, 1500)}]")
 
     else:
         return   # stickers, video, reactions: ignored

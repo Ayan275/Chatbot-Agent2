@@ -42,10 +42,19 @@ namespace {
 // Returns (and lazily creates) the isolated temp directory ./temp/.
 // On POSIX, permissions are set to owner-only (0700) to restrict access.
 fs::path tempDir() {
-    static const fs::path dir = fs::path("temp");
+    fs::path dir = fs::path("temp");
     std::error_code ec;
     fs::create_directories(dir, ec);
-    if (ec) Logger::log("WARN", "Could not create temp directory: " + ec.message());
+    if (ec || !fs::exists(dir)) {
+#ifndef _WIN32
+        dir = fs::path("/tmp");
+#else
+        const char* tmpEnv = std::getenv("TEMP");
+        if (!tmpEnv) tmpEnv = std::getenv("TMP");
+        if (tmpEnv) dir = fs::path(tmpEnv);
+#endif
+        Logger::log("WARN", "Using fallback temp directory: " + dir.string());
+    }
     return dir;
 }
 
@@ -76,6 +85,18 @@ std::string makeToken() {
     return ss.str();
 }
 
+static std::string getPythonExecutable() {
+    const char* env = std::getenv("PYTHON_EXECUTABLE");
+    if (env && *env) {
+        return std::string(env);
+    }
+#ifdef _WIN32
+    return "python";
+#else
+    return "python3";
+#endif
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -102,12 +123,19 @@ static bool runPython(const fs::path& req, const fs::path& res, int timeout = TI
         return false;
     }
 
+    std::string pythonExe = getPythonExecutable();
+
 #ifdef _WIN32
-    // Build the command line safely: "python" "<absolute_script_path>" "req" "res"
+    // Build the command line safely: "<pythonExe>" "<absolute_script_path>" "req" "res"
     // std::quoted ensures embedded spaces/quotes in paths are correctly escaped.
-    // CreateProcessA resolves "python" via PATH; no shell (cmd.exe) is spawned.
+    // CreateProcessA resolves pythonExe via PATH or explicit binary path; no shell is spawned.
     std::ostringstream cmdLineStream;
-    cmdLineStream << "python " << std::quoted(scriptPath.string()) << " "
+    if (pythonExe.find(' ') != std::string::npos && pythonExe.front() != '"') {
+        cmdLineStream << "\"" << pythonExe << "\" ";
+    } else {
+        cmdLineStream << pythonExe << " ";
+    }
+    cmdLineStream << std::quoted(scriptPath.string()) << " "
                   << std::quoted(req.string()) << " "
                   << std::quoted(res.string());
     std::string cmdLine = cmdLineStream.str();
@@ -128,7 +156,7 @@ static bool runPython(const fs::path& req, const fs::path& res, int timeout = TI
             CREATE_NO_WINDOW, // prevent a console window for the Python helper
             nullptr, nullptr, // environment / current directory (inherit)
             &si, &pi)) {
-        Logger::log("ERROR", "CreateProcess failed: python subprocess could not be started");
+        Logger::log("ERROR", "CreateProcess failed: python subprocess could not be started (" + pythonExe + ")");
         return false;
     }
 
@@ -151,10 +179,10 @@ static bool runPython(const fs::path& req, const fs::path& res, int timeout = TI
     std::string scriptStr = scriptPath.string();
 
     // Build an explicit argv[] — execvp does NOT invoke a shell.
-    // argv[0] = "python"  (execvp searches PATH for this name)
+    // argv[0] = pythonExe (execvp searches PATH or absolute path for this name)
     // argv[1] = absolute api.py path, argv[2] = req path, argv[3] = res path
     std::vector<char*> argv;
-    argv.push_back(const_cast<char*>("python"));
+    argv.push_back(const_cast<char*>(pythonExe.c_str()));
     argv.push_back(const_cast<char*>(scriptStr.c_str()));
     argv.push_back(const_cast<char*>(reqStr.c_str()));
     argv.push_back(const_cast<char*>(resStr.c_str()));
@@ -167,7 +195,7 @@ static bool runPython(const fs::path& req, const fs::path& res, int timeout = TI
     }
     if (pid == 0) {
         // Child process: replace image with python — no shell is used.
-        execvp("python", argv.data());
+        execvp(pythonExe.c_str(), argv.data());
         // execvp returns only on error; exit immediately so we don't duplicate
         // parent state or run destructors in the child.
         _exit(127);
@@ -376,9 +404,15 @@ void runWrongCommand(const std::string& severity) {
     Logger::log("INFO", "runWrongCommand: using script at " + scriptPath.string());
 
 #ifdef _WIN32
-    // Build command line: python "<absolute_path_to_script>" --wrong --severity "<severity>"
+    // Build command line: <pythonExe> "<absolute_path_to_script>" --wrong --severity "<severity>"
+    std::string pyExe = getPythonExecutable();
     std::ostringstream cmdStream;
-    cmdStream << "python " << std::quoted(scriptPath.string()) << " --wrong --severity " << std::quoted(severity);
+    if (pyExe.find(' ') != std::string::npos && pyExe.front() != '"') {
+        cmdStream << "\"" << pyExe << "\" ";
+    } else {
+        cmdStream << pyExe << " ";
+    }
+    cmdStream << std::quoted(scriptPath.string()) << " --wrong --severity " << std::quoted(severity);
     std::string cmdLine = cmdStream.str();
 
     std::vector<char> cmdBuf(cmdLine.begin(), cmdLine.end());
@@ -416,10 +450,11 @@ void runWrongCommand(const std::string& severity) {
 
 #else
     // POSIX: fork()+execvp without a shell.
+    std::string pyExeP = getPythonExecutable();
     std::string scriptStr = scriptPath.string();
     std::string sevStr = severity;
     std::vector<char*> argv;
-    argv.push_back(const_cast<char*>("python"));
+    argv.push_back(const_cast<char*>(pyExeP.c_str()));
     argv.push_back(const_cast<char*>(scriptStr.c_str()));
     argv.push_back(const_cast<char*>("--wrong"));
     argv.push_back(const_cast<char*>("--severity"));
@@ -432,7 +467,7 @@ void runWrongCommand(const std::string& severity) {
         return;
     }
     if (pid == 0) {
-        execvp("python", argv.data());
+        execvp(pyExeP.c_str(), argv.data());
         _exit(127);
     }
     int status = 0;
