@@ -472,6 +472,7 @@ int main(int argc, char** argv) {
                 // Use getReplyWithAudit() — includes transparency footer
                 auto reply = bot->getReplyWithAudit(msg);
                 std::cout << "Bot: " << reply << "\n";
+                std::cout.flush();
 
                 // Save plain reply to memory (strip transparency footer for file storage)
                 // The footer begins with "\n  ┌" — find and exclude it from the saved text

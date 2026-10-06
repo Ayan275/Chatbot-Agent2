@@ -68,6 +68,7 @@ class ChatbotProc:
         self.exe, self.user = exe, user
         self.proc = None
         self.q: "queue.Queue[bytes | None]" = queue.Queue()
+        self.stdout_buffer = bytearray()
         self.lock = threading.Lock()
 
     @staticmethod
@@ -89,6 +90,7 @@ class ChatbotProc:
                        PYTHONIOENCODING="utf-8",
                        PYTHON_EXECUTABLE=os.environ.get("PYTHON_EXECUTABLE", "python3"))
             self.q = queue.Queue()
+            self.stdout_buffer.clear()
             try:
                 self.proc = subprocess.Popen([str(self.exe), "--agent", self.user], cwd=str(BASE_DIR),
                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -123,8 +125,19 @@ class ChatbotProc:
         self.proc = None
 
     def _read_ready(self, timeout):
-        buf, deadline = b"", time.monotonic() + timeout
+        deadline = time.monotonic() + timeout
         while True:
+            marker_index = self.stdout_buffer.find(self.MARK)
+            if marker_index >= 0:
+                marker_end = marker_index + len(self.MARK)
+                if self.stdout_buffer[marker_end:marker_end + 2] == b"\r\n":
+                    marker_end += 2
+                elif self.stdout_buffer[marker_end:marker_end + 1] == b"\n":
+                    marker_end += 1
+                output = bytes(self.stdout_buffer[:marker_index])
+                del self.stdout_buffer[:marker_end]
+                return output.decode("utf-8", "replace")
+
             left = deadline - time.monotonic()
             if left <= 0:
                 self._kill()
@@ -135,19 +148,15 @@ class ChatbotProc:
                 continue
             if chunk is None:
                 self._kill()
-                raise ChatbotDied(buf.decode("utf-8", "replace").strip()[-300:] or "chatbot exited")
-            buf += chunk
-            i = buf.find(self.MARK)
-            if i >= 0:
-                return buf[:i].decode("utf-8", "replace")
+                output = bytes(self.stdout_buffer).decode("utf-8", "replace").strip()[-300:]
+                raise ChatbotDied(output or "chatbot exited")
+            self.stdout_buffer.extend(chunk)
 
     def ask(self, line: str) -> str:
         """Type one line into the chatbot; return everything it printed before the next prompt."""
         with self.lock:
             if self.proc is None or self.proc.poll() is not None:
                 self._start()
-            while not self.q.empty():          # drop stray leftovers
-                self.q.get_nowait()
             try:
                 self.proc.stdin.write((line.replace("\r", " ").replace("\n", " ") + "\n").encode("utf-8"))
                 self.proc.stdin.flush()

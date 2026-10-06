@@ -313,6 +313,32 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
         self.assertEqual(parts[2]["inline_data"]["mime_type"], "audio/ogg")
         self.assertEqual(base64.b64decode(parts[2]["inline_data"]["data"]), b"sample voice note")
 
+    def test_ipc_reads_back_to_back_stdout_turns_without_stale_bytes(self) -> None:
+        proc = whatsapp_agent.ChatbotProc(Path("unused"), "Ayan")
+        proc.q.put(b"first turn\n<<READY>>\nsecond turn\n<<READY>>\n")
+
+        self.assertEqual(proc._read_ready(1), "first turn\n")
+        self.assertEqual(proc._read_ready(1), "second turn\n")
+        self.assertEqual(proc.stdout_buffer, bytearray())
+
+    def test_gemini_404_reports_actual_api_error_detail(self) -> None:
+        error_body = json.dumps({"error": {"message": "Requested model is not available."}})
+
+        self.assertEqual(
+            api._friendly_status(404, error_body),
+            "Gemini returned HTTP 404: Requested model is not available.",
+        )
+
+    def test_ipc_error_response_replaces_stale_response_atomically(self) -> None:
+        response_path = Path(self.temp_dir.name) / "response.json"
+        response_path.write_text(json.dumps({"error": "old cached HTTP 404"}), encoding="utf-8")
+
+        self.assertTrue(api.write_error(str(response_path), "Current bridge failure."))
+        self.assertEqual(
+            json.loads(response_path.read_text(encoding="utf-8")),
+            {"error": "Current bridge failure."},
+        )
+
     def test_main_returns_error_json_with_success_exit_status(self) -> None:
         request_path = Path(self.temp_dir.name) / "request.json"
         response_path = Path(self.temp_dir.name) / "response.json"

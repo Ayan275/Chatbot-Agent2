@@ -175,9 +175,7 @@ def write_error(path: str, message: str) -> bool:
     """Write a JSON error payload to the response file and log it."""
     try:
         response_path = Path(path)
-        response_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(response_path, "w", encoding="utf-8") as fh:
-            json.dump({"error": message}, fh)
+        atomic_write_json(response_path, {"error": message})
         log.error("Error response written: %s", message)
         return True
     except OSError as exc:
@@ -359,19 +357,18 @@ def _save_runtime_state(user_query: str, bot_response: str) -> None:
 # Core API bridge  (Gemini)
 # ===========================================================================
 
-# Gemini 1.5 has been retired, and Gemini 2.0 shut down in June 2026.
 # Keep model selection on currently active generateContent models.
-DEFAULT_MODEL = "gemini-1.5-flash"
+DEFAULT_MODEL = "gemini-2.5-flash"
 SUPPORTED_MODELS = frozenset({
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-2.0-flash-exp",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
 })
 _configured_fallbacks = [
     model.strip()
     for model in os.getenv(
         "GEMINI_FALLBACKS",
-        "gemini-1.5-flash,gemini-1.5-pro",
+        "gemini-2.5-flash-lite,gemini-2.5-pro",
     ).split(",")
     if model.strip()
 ]
@@ -509,6 +506,14 @@ def _friendly_status(status: int, body: str) -> str:
         return "API rate limit exceeded. Please try again later."
     if status in (500, 502, 503, 504):
         return "Gemini is busy right now (high demand). Please try again in a moment."
+    if status == 404:
+        try:
+            detail = json.loads(body).get("error", {}).get("message")
+        except (AttributeError, TypeError, ValueError):
+            detail = None
+        if isinstance(detail, str) and detail.strip():
+            return f"Gemini returned HTTP 404: {detail.strip()}"
+        return f"Gemini returned HTTP 404: {body[:500] or 'The model or endpoint was not found.'}"
     return f"Gemini request failed (HTTP {status})."
 
 
@@ -593,7 +598,7 @@ def _call_gemini(model: str, system: str, contents: list, temperature: float = 0
     budget_s = min(budget_s, 15.0)
     t0 = time.monotonic()
     deadline = t0 + budget_s
-    last_msg = "Gemini request failed."
+    last_msg = None
 
     for name in [model] + [m for m in FALLBACK_MODELS if m != model]:
         for attempt in range(2):
@@ -610,6 +615,10 @@ def _call_gemini(model: str, system: str, contents: list, temperature: float = 0
                 raise BridgeError("No Internet Connection. Please check your network and try again.")
             except requests.exceptions.RequestException as exc:
                 last_msg = f"Network error: {type(exc).__name__}."
+                break
+
+            if r is None:
+                last_msg = "Gemini request deadline expired before receiving a response."
                 break
 
             if r.ok:
@@ -646,7 +655,7 @@ def _call_gemini(model: str, system: str, contents: list, temperature: float = 0
                 continue                            # temporary overload: retry once
             break                                   # 404 / 429 / other: next model
 
-    raise BridgeError(last_msg)
+    raise BridgeError(last_msg or "Gemini request could not be completed.")
 
 
 def run_turn(messages: list[dict], model: Optional[str] = None, media_parts=None,
