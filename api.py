@@ -361,11 +361,11 @@ def _save_runtime_state(user_query: str, bot_response: str) -> None:
 
 # Gemini 1.5 has been retired, and Gemini 2.0 shut down in June 2026.
 # Keep model selection on currently active generateContent models.
-DEFAULT_MODEL = "gemini-2.5-flash"
-SUPPORTED_MODELS = frozenset({
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
+DEFAULT_MODEL = "gemini-1.5-flash"
+SUPPORTED_MODELS = frozenSet({
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "gemini-2.0-flash-exp",
 })
 _configured_fallbacks = [
     model.strip()
