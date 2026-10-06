@@ -359,12 +359,12 @@ def _save_runtime_state(user_query: str, bot_response: str) -> None:
 # Core API bridge  (Gemini)
 # ===========================================================================
 
-# gemini-2.0-flash is the fastest production-grade model as of 2025.
-# Override at runtime with GEMINI_MODEL env var (e.g. gemini-1.5-flash-8b for even lower latency).
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+# Use a currently supported multimodal generateContent model by default.
+# Override at runtime with GEMINI_MODEL when selecting another supported model.
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 FALLBACK_MODELS = [m.strip() for m in os.getenv(
     "GEMINI_FALLBACKS",
-    "gemini-1.5-flash,gemini-1.5-flash-8b,gemini-2.5-flash"
+    "gemini-2.5-flash-lite,gemini-2.5-pro"
 ).split(",") if m.strip()]
 GEMINI_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
 THINK_CACHE_PATH: Path = BASE_DIR / "gemini_thinking.json"   # remembers which thinking setting each model accepts

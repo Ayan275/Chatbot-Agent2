@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import api
+import whatsapp_agent
 from PIL import Image
 from self_correction_chatbot import ChatbotApp
 
@@ -180,6 +181,59 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
 
         with self.assertRaises(api.BridgeError):
             api.media_part(b"not an image", "image/png")
+
+    def test_whatsapp_image_digest_sends_prompt_and_base64_image(self) -> None:
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), color="blue").save(image_buffer, format="JPEG")
+        image_bytes = image_buffer.getvalue()
+
+        with patch.dict(os.environ, {"GEMINI_MODEL": ""}):
+            self.assertEqual(api._pick_model(whatsapp_agent.cfg_model()), "gemini-2.5-flash")
+
+        with patch.object(api, "_call_gemini", return_value=("A blue image.", {})) as call:
+            result = whatsapp_agent.digest("image", image_bytes, "IMAGE/JPEG; charset=binary")
+
+        self.assertEqual(result, "A blue image.")
+        contents = call.call_args.args[2]
+        parts = contents[0]["parts"]
+        self.assertIn("Describe this image", parts[0]["text"])
+        self.assertEqual(parts[1]["inline_data"]["mime_type"], "image/jpeg")
+        self.assertEqual(base64.b64decode(parts[1]["inline_data"]["data"]), image_bytes)
+
+    def test_gemini_generate_uses_v1beta_model_and_multipart_json(self) -> None:
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), color="green").save(image_buffer, format="PNG")
+        image_bytes = image_buffer.getvalue()
+        media = api.media_part(image_bytes, "image/png")
+
+        class SuccessfulResponse:
+            status_code = 200
+            ok = True
+
+        with patch.dict(os.environ, {"GEMINI_THINKING": "default"}), \
+             patch.object(api, "_load_think_cache", return_value={}), \
+             patch.object(api, "_save_think_cache"), \
+             patch.object(api.requests, "post", return_value=SuccessfulResponse()) as post:
+            api._generate(
+                "gemini-2.5-flash",
+                "test-key",
+                "",
+                [{"role": "user", "parts": [{"text": "Describe this image."}, media]}],
+                0.1,
+                10,
+            )
+
+        url = post.call_args.args[0]
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(
+            url,
+            f"{api.GEMINI_URL}/models/gemini-2.5-flash:generateContent",
+        )
+        self.assertEqual(post.call_args.kwargs["headers"]["x-goog-api-key"], "test-key")
+        parts = payload["contents"][0]["parts"]
+        self.assertEqual(parts[0], {"text": "Describe this image."})
+        self.assertEqual(parts[1]["inline_data"]["mime_type"], "image/png")
+        self.assertEqual(base64.b64decode(parts[1]["inline_data"]["data"]), image_bytes)
 
     def test_main_returns_error_json_with_success_exit_status(self) -> None:
         request_path = Path(self.temp_dir.name) / "request.json"

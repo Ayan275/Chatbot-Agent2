@@ -315,7 +315,8 @@ def download(media_id):
 # ---------- Gemini: ears and eyes ----------
 def cfg_model():
     try:
-        return json.load(open(BASE_DIR / "config.json", encoding="utf-8")).get("model")
+        with (BASE_DIR / "config.json").open(encoding="utf-8") as config_file:
+            return json.load(config_file).get("model")
     except Exception:
         return None
 
@@ -355,11 +356,13 @@ def digest(kind: str, data: bytes | str | os.PathLike | None = None,
         if kind == "image":
             if data is None:
                 raise ValueError("Image payload is missing.")
-            mime = mime or "image/jpeg"
+            mime = (mime or "image/jpeg").split(";", 1)[0].strip().lower()
             if not mime.lower().startswith("image/"):
                 raise ValueError("Image payload has an invalid MIME type.")
             ask = ("Describe this image concisely: what it shows, any visible text, and key details. "
                    "Plain text only, no markdown, at most 800 characters.")
+            image = gemini.media_part(data, mime)
+            return gem([{"text": ask}, image], MEDIA_BUDGET)
         else:
             ask = ("Summarise this document: topic, key points, important numbers, names and dates. "
                    "Plain text only, no markdown, at most 1000 characters.")

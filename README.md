@@ -1,17 +1,17 @@
 # Hybrid C++/Python Chatbot
 
-A production-ready hybrid chatbot with a **C++ terminal interface** and a **Python/OpenRouter API backend**.  
-The C++ core manages all application state, IPC, and user interaction; Python handles network communication with the [OpenRouter](https://openrouter.ai) API, giving access to models such as `openai/gpt-4o-mini`
+A production-ready hybrid chatbot with a **C++ terminal interface** and a **Python/Gemini API backend**.
+The C++ core manages all application state, IPC, and user interaction; Python handles network communication with the Gemini API.
 
 ---
 
 ## Key Features
 
-- **Hybrid architecture**: C++ manages the CLI, conversation state, session memory, and subprocess orchestration; Python handles all OpenRouter API communication.
+- **Hybrid architecture**: C++ manages the CLI, conversation state, session memory, and subprocess orchestration; Python handles Gemini API communication.
 - **Novelty: Self-Accountable AI**: The system monitors its own reliability and logs every interaction.
   - **Decision Audit Trail**: Every AI response is permanently logged with its query, model, generation time, and confidence score.
   - **Trust Degradation Protocol**: Users can rate responses. Wrong answers reduce the AI's internal trust score, prompting transparency advisories on future responses if trust drops too low.
-- **OpenRouter backend**: Supports any model available on OpenRouter via a single `OPENROUTER_KEY` environment variable.
+- **Gemini backend**: Uses the v1beta `generateContent` endpoint and supports text and inline image/audio/document parts.
 - **Dynamic configuration**: Load `config.json` at startup to override the model, turn limits, and history size without recompiling.
 - **Unified logger**: Thread-safe `Logger` utility writes ISO-8601 timestamped entries to `app.log` from all components.
 - **500-word response limit**: Replies are word-capped and Markdown-stripped for clean terminal output.
@@ -30,7 +30,7 @@ The C++ core manages all application state, IPC, and user interaction; Python ha
 |---|---|
 | `src/` | C++ source files (main, chatbot, api bridge, memory, user, AuditLogger, TrustTracker) |
 | `include/` | C++ headers |
-| `api.py` | Python/OpenRouter API bridge |
+| `api.py` | Python/Gemini API bridge |
 | `CMakeLists.txt` | Build configuration with FetchContent for `nlohmann/json` |
 | `requirements.txt` | Python dependencies (`requests>=2.31.0`) |
 | `config.json` | Optional runtime configuration |
@@ -79,14 +79,17 @@ python -m pip install -r requirements.txt
 
 ## API Key Setup
 
-This project uses the [OpenRouter](https://openrouter.ai) API. Set your key as an environment variable before running:
+This project uses the [Gemini API](https://ai.google.dev/gemini-api/docs). Set your key as an environment variable before running:
 
 ```powershell
 # PowerShell (current session)
-$env:OPENROUTER_KEY = "your-openrouter-api-key"
+$env:GEMINI_API_KEY = "your-gemini-api-key"
 
 # PowerShell (permanent, user-level)
-[System.Environment]::SetEnvironmentVariable("OPENROUTER_KEY", "your-key", "User")
+[System.Environment]::SetEnvironmentVariable("GEMINI_API_KEY", "your-key", "User")
+
+The default model is `gemini-2.5-flash`; set `GEMINI_MODEL` to another currently supported
+Gemini `generateContent` model to override it.
 ```
 
 ---

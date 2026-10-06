@@ -1,5 +1,5 @@
 {
-    "model": "gemini-3.8-flash",
+    "model": "gemini-2.5-flash",
     "maxTurns": 1000,
     "maxHistoryMessages": 10,
     "maxStringHistory": 20
