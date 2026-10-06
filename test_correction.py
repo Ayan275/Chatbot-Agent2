@@ -200,8 +200,8 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
     def test_gemini_models_and_fallbacks_use_active_allowlist(self) -> None:
         active_models = {
             "gemini-3.1-pro-preview",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
         }
 
         self.assertEqual(api.DEFAULT_MODEL, "gemini-3.1-pro-preview")

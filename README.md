@@ -98,7 +98,7 @@ $env:GEMINI_API_KEY = "your-gemini-api-key"
 ```
 
 The default model is `gemini-3.1-pro-preview`. `GEMINI_MODEL` can select
-`gemini-2.5-flash` or `gemini-2.5-flash-lite`; unsupported model names use the default.
+`gemini-3.5-flash` or `gemini-3.5-flash-lite`; unsupported model names use the default.
 
 ---
 
