@@ -193,9 +193,20 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
             self.assertEqual(decoded.getpixel((0, 0)), (128, 0, 128))
 
     def test_model_picker_uses_active_model_for_retired_overrides(self) -> None:
-        for retired_model in ("gemini-1.5-flash", "gemini-2.0-flash", "gemini-3.8-flash"):
+        for retired_model in ("gemini-2.0-flash", "gemini-3.8-flash", "not-a-gemini-model"):
             with self.subTest(model=retired_model), patch.dict(os.environ, {"GEMINI_MODEL": retired_model}):
-                self.assertEqual(api._pick_model("gemini-2.5-pro"), api.DEFAULT_MODEL)
+                self.assertEqual(api._pick_model("gemini-3.1-pro-preview"), api.DEFAULT_MODEL)
+
+    def test_gemini_models_and_fallbacks_use_active_allowlist(self) -> None:
+        active_models = {
+            "gemini-3.1-pro-preview",
+            "gemini-1.5-flash",
+            "gemini-2.5-flash",
+        }
+
+        self.assertEqual(api.DEFAULT_MODEL, "gemini-3.1-pro-preview")
+        self.assertEqual(api.SUPPORTED_MODELS, active_models)
+        self.assertLessEqual(set(api.FALLBACK_MODELS), active_models)
 
     def test_whatsapp_state_round_trips_atomically(self) -> None:
         state_path = Path(self.temp_dir.name) / "wa_state.json"

@@ -358,17 +358,19 @@ def _save_runtime_state(user_query: str, bot_response: str) -> None:
 # ===========================================================================
 
 # Keep model selection on currently active generateContent models.
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.1-pro-preview"
+
 SUPPORTED_MODELS = frozenset({
+    "gemini-3.1-pro-preview",
+    "gemini-1.5-flash",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
 })
+
 _configured_fallbacks = [
     model.strip()
     for model in os.getenv(
         "GEMINI_FALLBACKS",
-        "gemini-2.5-flash-lite,gemini-2.5-pro",
+        "gemini-1.5-flash,gemini-2.5-flash",
     ).split(",")
     if model.strip()
 ]

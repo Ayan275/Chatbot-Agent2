@@ -97,8 +97,8 @@ $env:GEMINI_API_KEY = "your-gemini-api-key"
 [System.Environment]::SetEnvironmentVariable("GEMINI_API_KEY", "your-key", "User")
 ```
 
-The default model is `gemini-2.5-flash`. `GEMINI_MODEL` can select
-`gemini-2.5-flash-lite` or `gemini-2.5-pro`; unsupported or retired names use the default.
+The default model is `gemini-3.1-pro-preview`. `GEMINI_MODEL` can select
+`gemini-1.5-flash` or `gemini-2.5-flash`; unsupported model names use the default.
 
 ---
 
