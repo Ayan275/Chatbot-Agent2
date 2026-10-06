@@ -67,6 +67,14 @@ The image builds the C++ chatbot with CMake/GCC and launches it through
 `whatsapp_agent.py`. Set `CHATBOT_EXE` to override the default
 `/app/chatbot_linux`.
 
+Railway can deploy this worker from the repository Dockerfile. Configure
+`WA_AGENT_TOKEN` and `GEMINI_API_KEY` as service variables; `CHATBOT_USER`
+defaults to `Ayan`. The worker does not expose an HTTP port. Runtime user,
+correction, audit, and WhatsApp offset state are stored under `/app`; they are
+not durable across container replacement. Persistent-volume path support is
+not wired yet, so do not mount a volume over `/app` (it would hide the app and
+binary).
+
 ---
 
 ## Python Setup
@@ -87,10 +95,10 @@ $env:GEMINI_API_KEY = "your-gemini-api-key"
 
 # PowerShell (permanent, user-level)
 [System.Environment]::SetEnvironmentVariable("GEMINI_API_KEY", "your-key", "User")
-
-The default model is `gemini-2.5-flash`; set `GEMINI_MODEL` to another currently supported
-Gemini `generateContent` model to override it.
 ```
+
+The default model is `gemini-2.5-flash`. `GEMINI_MODEL` can select
+`gemini-2.5-flash-lite` or `gemini-2.5-pro`; unsupported or retired names use the default.
 
 ---
 
@@ -154,7 +162,7 @@ User Input
    │                                     ▲
    │ (2. API Call)                       │ (4. User Feedback)
    ▼                                     │
-[OpenRouter API]                         │
+[Gemini API]                             │
    │                                     │
    ▼                                     │
 [Chatbot Engine] ──(3. Log Record)───► [AuditLogger]

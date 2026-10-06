@@ -1,7 +1,7 @@
 """
 api.py — Gemini API bridge with Self-Correction Enforcement.
-(Drop-in replacement: same request/response file contract as the OpenRouter version,
- so the C++ side needs NO changes. Also exposes run_turn() for the WhatsApp agent.)
+Keeps a stable request/response contract for the C++ caller and exposes run_turn()
+for the WhatsApp agent.
 Usage:  python api.py <request_file> <response_file>
 
 C++ INTEGRATION ARCHITECTURE:
@@ -273,7 +273,7 @@ def _build_interception_prompt(user_query: str, rejected_response: str, matched_
         "CRITICAL RULES FOR THIS TURN:\n"
         "1. ABSOLUTE FACT BANNING: You are STRICTLY FORBIDDEN from outputting the exact answer, exact string, or primary factual noun from the rejected history.\n"
         "2. Do NOT print the exact string or the single-word repetition of the previous fact.\n"
-        "3. Instantly pivot: Provide a broader, multi-perspective overview, include historical context of why this choice was made, or break down the administrative structure instead of repeating the same short response loop.\n"
+        "3. POSITIVE COMPENSATORY SHIFT: Instantly pivot to a useful alternative, multi-perspective explanation; add relevant context rather than returning only a refusal.\n"
         "4. ALTERNATIVE CONTEXT: If the query matches a historical correction, change your approach entirely by giving geographic coordinates, administrative structure, history of the selection, or a different educational perspective.\n"
         "5. LANGUAGE SYNCHRONIZATION: Maintain strict linguistic alignment with the user's current query (if they ask in Roman Urdu, adapt the explanation fluently while avoiding the rejected wording).\n"
         f"Rejected response anchor: {rejected_response}\n"
@@ -350,7 +350,7 @@ def _save_runtime_state(user_query: str, bot_response: str) -> None:
             "[RuntimeState] Saved — query: '%s...' response: '%s...'",
             user_query[:60], bot_response[:60],
         )
-    except OSError as exc:
+    except (OSError, TypeError, ValueError) as exc:
         # Non-fatal: API still returns successfully; /wrong will just fail gracefully.
         log.error("[RuntimeState] Cannot write runtime_state.json: %s", exc)
 
@@ -359,13 +359,25 @@ def _save_runtime_state(user_query: str, bot_response: str) -> None:
 # Core API bridge  (Gemini)
 # ===========================================================================
 
-# Use a currently supported multimodal generateContent model by default.
-# Override at runtime with GEMINI_MODEL when selecting another supported model.
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-FALLBACK_MODELS = [m.strip() for m in os.getenv(
-    "GEMINI_FALLBACKS",
-    "gemini-2.5-flash-lite,gemini-2.5-pro"
-).split(",") if m.strip()]
+# Gemini 1.5 has been retired, and Gemini 2.0 shut down in June 2026.
+# Keep model selection on currently active generateContent models.
+DEFAULT_MODEL = "gemini-2.5-flash"
+SUPPORTED_MODELS = frozenset({
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+})
+_configured_fallbacks = [
+    model.strip()
+    for model in os.getenv(
+        "GEMINI_FALLBACKS",
+        "gemini-2.5-flash-lite,gemini-2.5-pro",
+    ).split(",")
+    if model.strip()
+]
+FALLBACK_MODELS = [model for model in _configured_fallbacks if model in SUPPORTED_MODELS]
+for _invalid_model in set(_configured_fallbacks) - SUPPORTED_MODELS:
+    log.warning("[Gemini] Ignoring unsupported fallback model %r", _invalid_model)
 GEMINI_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
 THINK_CACHE_PATH: Path = BASE_DIR / "gemini_thinking.json"   # remembers which thinking setting each model accepts
 
@@ -375,7 +387,8 @@ class BridgeError(Exception):
 
 
 def _media_bytes(data: object, mime: str) -> bytes:
-    """Load bytes or an allowed local path and validate image payloads before upload."""
+    """Serialize supported media inputs to bytes and validate image payloads."""
+    normalized_mime = mime.split(";", 1)[0].strip().lower()
     if isinstance(data, (bytes, bytearray, memoryview)):
         payload = bytes(data)
     elif isinstance(data, (str, os.PathLike)):
@@ -400,13 +413,33 @@ def _media_bytes(data: object, mime: str) -> bytes:
         except OSError as exc:
             raise BridgeError("Media file could not be read.") from exc
     else:
-        raise BridgeError("Media payload must be bytes or a local file path.")
+        from PIL import Image
+
+        if not isinstance(data, Image.Image):
+            raise BridgeError("Media payload must be bytes, a local file path, or a PIL image.")
+        image_formats = {
+            "image/jpeg": "JPEG",
+            "image/png": "PNG",
+            "image/webp": "WEBP",
+            "image/gif": "GIF",
+            "image/bmp": "BMP",
+            "image/tiff": "TIFF",
+        }
+        image_format = image_formats.get(normalized_mime)
+        if image_format is None:
+            raise BridgeError(f"Unsupported PIL image MIME type: {normalized_mime or '(empty)'}")
+        image_buffer = io.BytesIO()
+        try:
+            data.save(image_buffer, format=image_format)
+        except Exception as exc:
+            raise BridgeError("PIL image could not be encoded for Gemini.") from exc
+        payload = image_buffer.getvalue()
 
     if not payload:
         raise BridgeError("Media payload is empty.")
     if len(payload) > 20 * 1024 * 1024:
         raise BridgeError("Media payload exceeds the 20 MB upload limit.")
-    if mime.lower().startswith("image/"):
+    if normalized_mime.startswith("image/"):
         try:
             from PIL import Image
 
@@ -420,8 +453,12 @@ def _media_bytes(data: object, mime: str) -> bytes:
 def media_part(data: object, mime: str) -> dict:
     """Inline image / PDF / audio part (REST format) for run_turn(media_parts=...)."""
     try:
-        payload = _media_bytes(data, mime)
-        return {"inline_data": {"mime_type": mime, "data": base64.b64encode(payload).decode("ascii")}}
+        normalized_mime = mime.split(";", 1)[0].strip().lower()
+        payload = _media_bytes(data, normalized_mime)
+        return {"inline_data": {
+            "mime_type": normalized_mime,
+            "data": base64.b64encode(payload).decode("ascii"),
+        }}
     except BridgeError:
         raise
     except Exception as exc:
@@ -429,13 +466,13 @@ def media_part(data: object, mime: str) -> dict:
 
 
 def _pick_model(requested: Optional[str]) -> str:
-    """GEMINI_MODEL env wins; then a gemini name from config.json; else the default.
-    (config.json may still say 'openai/gpt-4o-mini' - that is ignored on purpose.)"""
-    env_model = os.getenv("GEMINI_MODEL")
-    if env_model:
-        return env_model.strip().split("/")[-1]
-    if isinstance(requested, str) and "gemini" in requested.lower():
-        return requested.strip().split("/")[-1]
+    """Select only an active, supported generateContent model."""
+    candidate = os.getenv("GEMINI_MODEL") or requested
+    if isinstance(candidate, str) and "gemini" in candidate.lower():
+        model = candidate.strip().split("/")[-1]
+        if model in SUPPORTED_MODELS:
+            return model
+        log.warning("[Gemini] Ignoring unsupported model %r; using %s", model, DEFAULT_MODEL)
     return DEFAULT_MODEL
 
 
@@ -492,24 +529,30 @@ def _thinking_variants(model: str) -> list:
 
 def _load_think_cache() -> dict:
     try:
-        return json.loads(THINK_CACHE_PATH.read_text(encoding="utf-8"))
+        cache = json.loads(THINK_CACHE_PATH.read_text(encoding="utf-8"))
+        return cache if isinstance(cache, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
 def _save_think_cache(cache: dict) -> None:
     try:
-        THINK_CACHE_PATH.write_text(json.dumps(cache), encoding="utf-8")
-    except OSError:
-        pass
+        atomic_write_json(THINK_CACHE_PATH, cache)
+    except (OSError, TypeError, ValueError) as exc:
+        log.warning("[Gemini] Could not persist thinking configuration: %s", exc)
 
 
 def _generate(model: str, key: str, system: str, contents: list, temperature: float, read_timeout: float):
     """One REST call (with thinking-variant negotiation). Returns the requests.Response."""
     cache = _load_think_cache()
-    variants = [cache[model]] if model in cache else _thinking_variants(model)
+    cached_variant = cache.get(model)
+    variants = [cached_variant] if cached_variant in (None, {"thinkingBudget": 0}) else _thinking_variants(model)
     last = None
+    deadline = time.monotonic() + read_timeout
     for think in variants:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         # 512 tokens covers ~380 words — enough for any WhatsApp reply.
         # Keeping this tight is the second-biggest latency win after model selection.
         gen_cfg: dict = {"temperature": temperature, "maxOutputTokens": 512}
@@ -518,12 +561,12 @@ def _generate(model: str, key: str, system: str, contents: list, temperature: fl
         body: dict = {"contents": contents, "generationConfig": gen_cfg}
         if system:
             body["systemInstruction"] = {"parts": [{"text": system}]}
-        connect_timeout = min(4.0, max(1.0, read_timeout / 3))
+        connect_timeout = min(4.0, max(0.25, remaining / 3))
         r = requests.post(
             f"{GEMINI_URL}/models/{model}:generateContent",
             headers={"x-goog-api-key": key, "Content-Type": "application/json"},
             json=body,
-            timeout=(connect_timeout, max(1.0, read_timeout - connect_timeout)))
+            timeout=(connect_timeout, max(0.25, remaining - connect_timeout)))
         if r.status_code == 400 and think is not None and "think" in r.text.lower():
             log.info("[Gemini] %s rejected thinking=%s, trying next setting", model, think)
             last = r
@@ -543,6 +586,9 @@ def _call_gemini(model: str, system: str, contents: list, temperature: float = 0
     key = os.getenv("GEMINI_API_KEY")
     if not key:
         raise BridgeError("GEMINI_API_KEY environment variable not set")
+    if model not in SUPPORTED_MODELS:
+        log.warning("[Gemini] Replacing unsupported requested model %r with %s", model, DEFAULT_MODEL)
+        model = DEFAULT_MODEL
 
     budget_s = min(budget_s, 15.0)
     t0 = time.monotonic()

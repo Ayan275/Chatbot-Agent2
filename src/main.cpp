@@ -49,7 +49,7 @@
 namespace {
 
 struct Config {
-    std::string model    = "openai/gpt-4o-mini";
+    std::string model    = "gemini-2.5-flash";
     int maxTurns         = 1000, maxHistoryMessages = 10, maxStringHistory = 20;
     int maxMessageLength = 2000, maxNameLength = 50;
     size_t maxFileBytes  = 1048576;

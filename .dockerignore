@@ -21,5 +21,7 @@ wa_state.json
 gemini_thinking.json
 audit_logs/
 temp/
+users.json
+corrections.json
 chat_*.txt
 export_*.md

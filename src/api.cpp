@@ -1,5 +1,5 @@
 /*
- * api.cpp — OpenRouter API bridge via Python subprocess with UUID-based IPC.
+ * api.cpp — Gemini API bridge via Python subprocess with UUID-based IPC.
  *
  * Security notes:
  *   - Linux/Mac: uses fork()+execvp() with an explicit argv[] — NO shell involved.
@@ -69,6 +69,12 @@ void ensureRestrictivePermissions(const fs::path& path) {
                     fs::perm_options::replace, ec);
     if (ec) Logger::log("WARN", "Could not set permissions on temp dir: " + ec.message());
 #endif
+}
+
+void removeTempFile(const fs::path& path) {
+    std::error_code ec;
+    fs::remove(path, ec);
+    if (ec) Logger::log("WARN", "Could not remove IPC file " + path.string() + ": " + ec.message());
 }
 
 std::string makeToken() {
@@ -166,9 +172,16 @@ static bool runPython(const fs::path& req, const fs::path& res, int timeout = TI
         TerminateProcess(pi.hProcess, 1);
         Logger::log("WARN", "Python subprocess timed out after " + std::to_string(timeout) + "s");
     }
+    DWORD exitCode = 1;
+    if (waitResult == WAIT_OBJECT_0 && !GetExitCodeProcess(pi.hProcess, &exitCode)) {
+        Logger::log("ERROR", "Could not read Python subprocess exit code");
+    }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return waitResult == WAIT_OBJECT_0;
+    if (waitResult == WAIT_OBJECT_0 && exitCode != 0) {
+        Logger::log("ERROR", "Python subprocess exited with code " + std::to_string(exitCode));
+    }
+    return waitResult == WAIT_OBJECT_0 && exitCode == 0;
 
 #else
     // Store the path strings as std::string locals so their c_str() pointers
@@ -250,30 +263,33 @@ std::string callAPI(nlohmann::json& history, const std::string& model, TokenUsag
             out << nlohmann::json{{"model", model}, {"messages", history}}.dump();
             if (!out.good()) {
                 Logger::log("ERROR", "Request file write failed");
-                fs::remove(reqFile);
+                out.close();
+                removeTempFile(reqFile);
                 return "System Error: Local workspace directory is write-protected.";
             }
         } catch (const std::exception& e) {
             Logger::log("ERROR", "Request JSON serialization failed: " + std::string(e.what()));
-            fs::remove(reqFile);
+            out.close();
+            removeTempFile(reqFile);
             return "System Error: Local workspace directory is write-protected.";
         }
     }
 
     // --- Spawn Python subprocess (no shell) ---
     bool processOk = runPython(reqFile, resFile);
-    fs::remove(reqFile);
+    removeTempFile(reqFile);
 
     if (!processOk) {
-        fs::remove(resFile);
+        removeTempFile(resFile);
         Logger::log("ERROR", "Python subprocess failed or timed out");
-        return "Error: Subprocess communication link severed (Check Python paths).";
+        return "Error: Python API bridge failed or timed out. Check Python, dependencies, and api.log.";
     }
 
     // --- Verify response file exists before reading ---
-    if (!fs::exists(resFile)) {
+    std::error_code responseEc;
+    if (!fs::exists(resFile, responseEc) || responseEc) {
         Logger::log("ERROR", "Response file was not created by subprocess");
-        return "Error: Subprocess communication link severed (Check Python paths).";
+        return "Error: Python API bridge did not create a response. Check Python, dependencies, and api.log.";
     }
 
     // --- Read and parse response ---
@@ -282,23 +298,25 @@ std::string callAPI(nlohmann::json& history, const std::string& model, TokenUsag
         std::ifstream in(resFile);
         if (!in.is_open()) {
             Logger::log("ERROR", "Cannot open response file");
-            fs::remove(resFile);
-            return "Error: Subprocess communication link severed (Check Python paths).";
+            removeTempFile(resFile);
+            return "Error: Python API bridge response could not be read. Check api.log.";
         }
         try {
             in >> res;
             if (in.fail()) {
                 Logger::log("ERROR", "Response file read failed");
-                fs::remove(resFile);
-                return "Error: Subprocess communication link severed (Check Python paths).";
+                in.close();
+                removeTempFile(resFile);
+                return "Error: Python API bridge returned an unreadable response. Check api.log.";
             }
         } catch (const nlohmann::json::parse_error& e) {
             Logger::log("ERROR", "JSON parse error in response: " + std::string(e.what()));
-            fs::remove(resFile);
-            return "Error: Subprocess communication link severed (Check Python paths).";
+            in.close();
+            removeTempFile(resFile);
+            return "Error: Python API bridge returned invalid JSON. Check api.log.";
         }
     }
-    fs::remove(resFile);
+    removeTempFile(resFile);
 
     // --- Check for API-level error ---
     if (res.contains("error")) {

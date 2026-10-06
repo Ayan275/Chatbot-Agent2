@@ -16,10 +16,11 @@ Env vars: WA_AGENT_TOKEN, GEMINI_API_KEY, CHATBOT_USER (needed if users.json has
 Optional: CHATBOT_EXE (full path to chatbot binary), GEMINI_MODEL
 Disabled over WhatsApp: /exit, exit, /changepassword (they need the terminal).
 """
-import os, io, re, sys, json, time, queue, asyncio, logging, tempfile, threading, subprocess
+import os, io, re, json, time, queue, asyncio, logging, tempfile, threading, subprocess
 import hashlib, secrets
 from pathlib import Path
 import requests, edge_tts
+from correction_utils import atomic_write_json
 
 import api as gemini   # your bridge (used here only for voice/image/document understanding)
 
@@ -42,11 +43,11 @@ BASE = "https://api.whatsapp.com/agent/v1"
 HTTP = requests.Session()
 HDR = {"Authorization": f"Bearer {os.environ['WA_AGENT_TOKEN']}"}
 STATE_FILE = BASE_DIR / "wa_state.json"
-OK_AUDIO = ("audio/ogg", "audio/mpeg", "audio/aac", "audio/wav", "audio/flac", "audio/opus", "audio/ogg; codecs=opus")
 BLOCKED_CMDS = ("/exit", "exit", "/changepassword")
 MAX_LINE = 1900            # chatbot hard limit is 2000 characters per message
 TURN_TIMEOUT = 40          # C++ API bridge has a 25 s hard timeout
-MEDIA_BUDGET = 30          # seconds budget for Gemini vision / audio calls (slower than text)
+MEDIA_BUDGET = 15          # bridge bounds Gemini calls to 15 seconds
+MAX_MEDIA_BYTES = 20 * 1024 * 1024
 
 log = logging.getLogger("wa_agent")
 log.setLevel(logging.INFO)
@@ -88,9 +89,12 @@ class ChatbotProc:
                        PYTHONIOENCODING="utf-8",
                        PYTHON_EXECUTABLE=os.environ.get("PYTHON_EXECUTABLE", "python3"))
             self.q = queue.Queue()
-            self.proc = subprocess.Popen([str(self.exe), "--agent", self.user], cwd=str(BASE_DIR),
-                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT, env=env, bufsize=0)
+            try:
+                self.proc = subprocess.Popen([str(self.exe), "--agent", self.user], cwd=str(BASE_DIR),
+                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT, env=env, bufsize=0)
+            except OSError as exc:
+                raise ChatbotDied(f"Could not start chatbot executable '{self.exe}': {exc}") from exc
             threading.Thread(target=self._pump, args=(self.proc, self.q), daemon=True).start()
             try:
                 banner = self._read_ready(60)
@@ -144,9 +148,13 @@ class ChatbotProc:
                 self._start()
             while not self.q.empty():          # drop stray leftovers
                 self.q.get_nowait()
-            self.proc.stdin.write((line.replace("\r", " ").replace("\n", " ") + "\n").encode("utf-8"))
-            self.proc.stdin.flush()
-            out = self._read_ready(TURN_TIMEOUT)
+            try:
+                self.proc.stdin.write((line.replace("\r", " ").replace("\n", " ") + "\n").encode("utf-8"))
+                self.proc.stdin.flush()
+                out = self._read_ready(TURN_TIMEOUT)
+            except (BrokenPipeError, OSError) as exc:
+                self._kill()
+                raise ChatbotDied(f"Chatbot IPC write failed: {exc}") from exc
         out = out.replace("\r\n", "\n")
         return re.sub(r"\x1b\[[0-9;]*m", "", out).strip()
 
@@ -163,21 +171,32 @@ def find_exe() -> Path:
     for c in cands:
         if c.is_file():
             return c
-    sys.exit("chatbot executable not found. Build it first with CMake or set CHATBOT_EXE.")
+    raise ChatbotDied("Chatbot executable not found. Build it with CMake or set CHATBOT_EXE.")
 
 
 def find_user() -> str:
     u = os.getenv("CHATBOT_USER", "").strip()
     if u:
         return u
+    users_path = BASE_DIR / "users.json"
     try:
-        names = [x["username"] for x in json.load(open(BASE_DIR / "users.json", encoding="utf-8"))]
-    except Exception:
+        with users_path.open(encoding="utf-8") as users_file:
+            users = json.load(users_file)
+        if not isinstance(users, list):
+            raise ValueError("users.json must contain a JSON array.")
+        names = [entry["username"] for entry in users
+                 if isinstance(entry, dict) and isinstance(entry.get("username"), str)]
+    except FileNotFoundError:
         names = []
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise ChatbotDied(f"Could not read chatbot user registry '{users_path}': {exc}") from exc
     if len(names) == 1:
         return names[0]
-    sys.exit("Set CHATBOT_USER to one of your chatbot users: " + (", ".join(names) or "(none found in users.json)")
-             + '\n  PowerShell:  $env:CHATBOT_USER="Ayan"')
+    if not names:
+        return "Ayan"
+    raise ChatbotDied(
+        "Set CHATBOT_USER to one of the configured chatbot users: " + ", ".join(names)
+    )
 
 
 def _ensure_user_profile(username: str) -> None:
@@ -236,7 +255,7 @@ def _ensure_user_profile(username: str) -> None:
         lock_path.unlink(missing_ok=True)
 
 
-bot: ChatbotProc  # created in main()
+bot: ChatbotProc | None = None  # initialized before polling starts
 
 
 def split_reply(out: str):
@@ -261,18 +280,25 @@ def api_call(method, path, **kw):
     """Backoff on 429 / 503(131016). 500s are NOT retried (could duplicate a send)."""
     timeout = kw.pop("timeout", 60)
     for i in range(4):
-        r = HTTP.request(method, BASE + path, headers=HDR, timeout=timeout, **kw)
+        try:
+            r = HTTP.request(method, BASE + path, headers=HDR, timeout=timeout, **kw)
+        except requests.RequestException:
+            log.exception("%s %s request failed", method, path)
+            raise
         if not (r.status_code == 429 or (r.status_code == 503 and "131016" in r.text)):
             return r
-        wait = 10 * 2**i
+        wait = min(8, 2**i)
         log.warning("%s %s -> %s, retrying in %ss", method, path, r.status_code, wait)
         time.sleep(wait)
     return r
 
 
 def send(to, type_, payload):
-    r = api_call("POST", "/messages", json={
-        "messaging_product": "whatsapp", "to": to, "type": type_, type_: payload})
+    try:
+        r = api_call("POST", "/messages", json={
+            "messaging_product": "whatsapp", "to": to, "type": type_, type_: payload})
+    except requests.RequestException:
+        return False
     if not r.ok:
         log.error("send failed %s: %s", r.status_code, r.text)
     return r.ok
@@ -285,13 +311,21 @@ def send_text(to, text):
 
 
 def send_audio(to, mp3_bytes):
-    r = api_call("POST", "/media",
-                 data={"messaging_product": "whatsapp", "type": "audio/mpeg"},
-                 files={"file": ("reply.mp3", mp3_bytes, "audio/mpeg")})
+    try:
+        r = api_call("POST", "/media",
+                     data={"messaging_product": "whatsapp", "type": "audio/mpeg"},
+                     files={"file": ("reply.mp3", mp3_bytes, "audio/mpeg")})
+    except requests.RequestException:
+        return
     if not r.ok:
         log.error("media upload failed %s: %s", r.status_code, r.text)
         return
-    send(to, "audio", {"id": r.json()["id"]})
+    try:
+        media_id = r.json()["id"]
+    except (ValueError, KeyError, TypeError) as exc:
+        log.error("media upload response was invalid: %s", exc)
+        return
+    send(to, "audio", {"id": media_id})
 
 
 def mark_read_typing(msg_id):
@@ -299,25 +333,44 @@ def mark_read_typing(msg_id):
         api_call("POST", "/statuses", json={
             "messaging_product": "whatsapp", "status": "read",
             "message_id": msg_id, "typing_indicator": {"type": "text"}})
-    except Exception as e:
-        log.warning("status failed: %s", e)
+    except requests.RequestException as exc:
+        log.warning("status request failed: %s", exc)
 
 
 def download(media_id):
     meta = api_call("GET", f"/media/{media_id}")
     meta.raise_for_status()
     meta = meta.json()
-    r = HTTP.get(meta["url"], headers=HDR, timeout=30)
-    r.raise_for_status()
-    return r.content, (meta.get("mime_type") or "").split(";")[0]
+    media_url = meta.get("url")
+    if not isinstance(media_url, str) or not media_url:
+        raise ValueError("WhatsApp media metadata did not contain a download URL.")
+    r = HTTP.get(media_url, headers=HDR, timeout=30, stream=True)
+    try:
+        r.raise_for_status()
+        content_length = r.headers.get("Content-Length")
+        if content_length and int(content_length) > MAX_MEDIA_BYTES:
+            raise ValueError("WhatsApp media exceeds the 20 MB processing limit.")
+        payload = bytearray()
+        for chunk in r.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            if len(payload) + len(chunk) > MAX_MEDIA_BYTES:
+                raise ValueError("WhatsApp media exceeds the 20 MB processing limit.")
+            payload.extend(chunk)
+    finally:
+        r.close()
+    mime = meta.get("mime_type")
+    return bytes(payload), mime.split(";", 1)[0].strip().lower() if isinstance(mime, str) else ""
 
 
 # ---------- Gemini: ears and eyes ----------
 def cfg_model():
     try:
         with (BASE_DIR / "config.json").open(encoding="utf-8") as config_file:
-            return json.load(config_file).get("model")
-    except Exception:
+            config = json.load(config_file)
+        return config.get("model") if isinstance(config, dict) else None
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Could not load Gemini model configuration: %s", exc)
         return None
 
 
@@ -394,7 +447,8 @@ def tts(text):
     os.close(fd)
     try:
         asyncio.run(edge_tts.Communicate(text, pick_voice(text)).save(path))
-        return open(path, "rb").read()
+        with open(path, "rb") as audio_file:
+            return audio_file.read()
     finally:
         try:
             os.remove(path)
@@ -469,6 +523,11 @@ def handle(msg):
     else:
         return   # stickers, video, reactions: ignored
 
+    if bot is None:
+        log.error("Ignoring message because the C++ chatbot is not initialized.")
+        send_text(to, "Chatbot abhi available nahi hai. Thori der baad dobara try karo.")
+        return
+
     try:
         out = bot.ask(line)
     except ChatbotDied as e:
@@ -490,25 +549,37 @@ def handle(msg):
 # ---------- state + poll loop ----------
 def load_state():
     try:
-        return json.load(open(STATE_FILE))
-    except Exception:
+        with STATE_FILE.open(encoding="utf-8") as state_file:
+            state = json.load(state_file)
+        if (isinstance(state, dict) and isinstance(state.get("offset"), int)
+                and isinstance(state.get("since"), int)
+                and isinstance(state.get("handled"), list)
+                and all(isinstance(item, str) for item in state["handled"])):
+            return state
+        raise ValueError("WhatsApp state file has an invalid schema.")
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        log.warning("Could not load WhatsApp state; initializing a fresh offset: %s", exc)
         return {"offset": 0, "since": int(time.time()), "handled": []}   # first run: ignore old backlog
 
 
 def save_state(st):
     st["handled"] = st["handled"][-500:]
-    json.dump(st, open(STATE_FILE, "w"))
+    try:
+        atomic_write_json(STATE_FILE, st)
+    except (OSError, TypeError, ValueError):
+        log.exception("Could not persist WhatsApp polling state.")
 
 
 def main():
     global bot
-    bot = ChatbotProc(find_exe(), find_user())
     try:
+        bot = ChatbotProc(find_exe(), find_user())
         bot.ask("/help")  # Starts agent mode, which provisions a missing user non-interactively.
     except ChatbotDied as exc:
-        log.critical("Chatbot failed to initialize user '%s': %s", bot.user, exc)
-        bot.close()
-        raise SystemExit(f"Chatbot startup failed for configured user '{bot.user}'.") from exc
+        log.critical("Chatbot startup failed: %s", exc)
+        if bot is not None:
+            bot.close()
+        return
     st = load_state()
     handled = set(st["handled"])
     log.info("WhatsApp agent started (user=%s, exe=%s, offset=%s)", bot.user, bot.exe.name, st["offset"])
@@ -537,11 +608,40 @@ def main():
                 time.sleep(10)
                 continue
 
-            data = r.json()
+            try:
+                data = r.json()
+                if not isinstance(data, dict) or not isinstance(data.get("entry", []), list):
+                    raise ValueError("WhatsApp updates response has an invalid schema.")
+                next_offset = data.get("next_offset")
+                if not isinstance(next_offset, int):
+                    raise ValueError("WhatsApp updates response has no valid next_offset.")
+            except (ValueError, requests.JSONDecodeError) as exc:
+                log.error("Invalid WhatsApp updates response: %s", exc)
+                time.sleep(5)
+                continue
+
             for entry in data.get("entry", []):
-                for ch in entry.get("changes", []):
-                    for m in ch["value"].get("messages", []):
-                        if m["id"] in handled or int(m["timestamp"]) < st["since"]:
+                if not isinstance(entry, dict):
+                    continue
+                changes = entry.get("changes", [])
+                if not isinstance(changes, list):
+                    continue
+                for ch in changes:
+                    if not isinstance(ch, dict) or not isinstance(ch.get("value"), dict):
+                        continue
+                    messages = ch["value"].get("messages", [])
+                    if not isinstance(messages, list):
+                        continue
+                    for m in messages:
+                        if not isinstance(m, dict) or not isinstance(m.get("id"), str):
+                            log.warning("Skipping malformed WhatsApp message event.")
+                            continue
+                        try:
+                            timestamp = int(m["timestamp"])
+                        except (KeyError, TypeError, ValueError):
+                            log.warning("Skipping WhatsApp message with invalid timestamp: %s", m["id"])
+                            continue
+                        if m["id"] in handled or timestamp < st["since"]:
                             continue
                         try:
                             handle(m)
@@ -550,7 +650,7 @@ def main():
                         handled.add(m["id"])
                         st["handled"].append(m["id"])
 
-            st["offset"] = data["next_offset"]   # pass back unchanged
+            st["offset"] = next_offset
             save_state(st)
     finally:
         bot.close()

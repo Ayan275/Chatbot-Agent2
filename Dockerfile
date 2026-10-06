@@ -30,12 +30,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # --- System packages ---
-# ffmpeg:          decode audio/ogg, audio/opus sent by WhatsApp before passing to Gemini
 # libstdc++6:      C++ runtime required by chatbot_linux
 # ca-certificates: TLS for Gemini / WhatsApp Meta API calls
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    ffmpeg \
     libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system app \
@@ -46,7 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN python3 --version \
     && pip install --no-cache-dir -r requirements.txt \
-    && python3 -c "import PIL, google.generativeai"
+    && python3 -c "import PIL, requests"
 
 # --- Application files ---
 COPY --from=cpp-builder /tmp/chatbot-build/chatbot_linux ./chatbot_linux

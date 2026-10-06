@@ -9,7 +9,7 @@ struct TokenUsage {
     int totalTokens = 0;
 };
 
-/* Core API bridge — sends history to OpenRouter via Python subprocess. */
+/* Core API bridge — sends history to Gemini via the Python subprocess. */
 std::string callAPI(nlohmann::json& history, const std::string& model, TokenUsage& usage);
 
 /*

@@ -182,6 +182,81 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
         with self.assertRaises(api.BridgeError):
             api.media_part(b"not an image", "image/png")
 
+    def test_media_part_encodes_pil_images(self) -> None:
+        image = Image.new("RGB", (2, 2), color="purple")
+
+        media = api.media_part(image, "image/png")
+
+        self.assertEqual(media["inline_data"]["mime_type"], "image/png")
+        with Image.open(io.BytesIO(base64.b64decode(media["inline_data"]["data"]))) as decoded:
+            self.assertEqual(decoded.size, (2, 2))
+            self.assertEqual(decoded.getpixel((0, 0)), (128, 0, 128))
+
+    def test_model_picker_uses_active_model_for_retired_overrides(self) -> None:
+        for retired_model in ("gemini-1.5-flash", "gemini-2.0-flash", "gemini-3.8-flash"):
+            with self.subTest(model=retired_model), patch.dict(os.environ, {"GEMINI_MODEL": retired_model}):
+                self.assertEqual(api._pick_model("gemini-2.5-pro"), api.DEFAULT_MODEL)
+
+    def test_whatsapp_state_round_trips_atomically(self) -> None:
+        state_path = Path(self.temp_dir.name) / "wa_state.json"
+        with patch.object(whatsapp_agent, "STATE_FILE", state_path):
+            expected = {"offset": 12, "since": 34, "handled": ["wamid.1"]}
+            whatsapp_agent.save_state(expected.copy())
+            self.assertEqual(whatsapp_agent.load_state(), expected)
+
+    def test_whatsapp_defaults_to_ayan_without_user_registry(self) -> None:
+        with patch.object(whatsapp_agent, "BASE_DIR", Path(self.temp_dir.name)), \
+             patch.dict(os.environ, {"CHATBOT_USER": ""}):
+            self.assertEqual(whatsapp_agent.find_user(), "Ayan")
+
+    def test_whatsapp_download_streams_and_caps_media(self) -> None:
+        class MetadataResponse:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, str]:
+                return {"url": "https://media.example.test/item", "mime_type": "audio/ogg; codecs=opus"}
+
+        class MediaResponse:
+            headers = {"Content-Length": "3"}
+
+            def __init__(self, chunks: list[bytes]):
+                self.chunks = chunks
+                self.closed = False
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def iter_content(self, chunk_size: int):
+                return iter(self.chunks)
+
+            def close(self) -> None:
+                self.closed = True
+
+        metadata = MetadataResponse()
+        media = MediaResponse([b"ab", b"c"])
+        with patch.object(whatsapp_agent, "api_call", return_value=metadata), \
+             patch.object(whatsapp_agent.HTTP, "get", return_value=media):
+            payload, mime = whatsapp_agent.download("media-id")
+        self.assertEqual((payload, mime), (b"abc", "audio/ogg"))
+        self.assertTrue(media.closed)
+
+        oversized = MediaResponse([b"unused"])
+        oversized.headers = {"Content-Length": str(whatsapp_agent.MAX_MEDIA_BYTES + 1)}
+        with patch.object(whatsapp_agent, "api_call", return_value=metadata), \
+             patch.object(whatsapp_agent.HTTP, "get", return_value=oversized):
+            with self.assertRaises(ValueError):
+                whatsapp_agent.download("media-id")
+        self.assertTrue(oversized.closed)
+
+    def test_whatsapp_text_gets_double_newline_sentence_format(self) -> None:
+        formatted = whatsapp_agent.clean_whatsapp_text("First sentence. Second sentence!\n1. One\n2. Two")
+
+        self.assertEqual(
+            formatted,
+            "First sentence.\n\nSecond sentence!\n\n1. One\n\n2. Two",
+        )
+
     def test_whatsapp_image_digest_sends_prompt_and_base64_image(self) -> None:
         image_buffer = io.BytesIO()
         Image.new("RGB", (2, 2), color="blue").save(image_buffer, format="JPEG")
@@ -205,6 +280,7 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
         Image.new("RGB", (2, 2), color="green").save(image_buffer, format="PNG")
         image_bytes = image_buffer.getvalue()
         media = api.media_part(image_bytes, "image/png")
+        audio = api.media_part(b"sample voice note", "audio/ogg")
 
         class SuccessfulResponse:
             status_code = 200
@@ -218,7 +294,7 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
                 "gemini-2.5-flash",
                 "test-key",
                 "",
-                [{"role": "user", "parts": [{"text": "Describe this image."}, media]}],
+                [{"role": "user", "parts": [{"text": "Describe this image."}, media, audio]}],
                 0.1,
                 10,
             )
@@ -234,6 +310,8 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
         self.assertEqual(parts[0], {"text": "Describe this image."})
         self.assertEqual(parts[1]["inline_data"]["mime_type"], "image/png")
         self.assertEqual(base64.b64decode(parts[1]["inline_data"]["data"]), image_bytes)
+        self.assertEqual(parts[2]["inline_data"]["mime_type"], "audio/ogg")
+        self.assertEqual(base64.b64decode(parts[2]["inline_data"]["data"]), b"sample voice note")
 
     def test_main_returns_error_json_with_success_exit_status(self) -> None:
         request_path = Path(self.temp_dir.name) / "request.json"

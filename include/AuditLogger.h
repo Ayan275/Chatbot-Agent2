@@ -34,9 +34,9 @@ struct AuditRecord {
     double      responseTimeMs;   // Wall-clock milliseconds for getReply()
     double      confidenceScore;  // Heuristic confidence [0.0 – 1.0]
     double      trustScore;       // Snapshot of TrustTracker score at log time
-    int         promptTokens;     // token usage counters from OpenRouter
-    int         completionTokens; // token usage counters from OpenRouter
-    int         totalTokens;      // token usage counters from OpenRouter
+    int         promptTokens;     // token usage counters from Gemini
+    int         completionTokens; // token usage counters from Gemini
+    int         totalTokens;      // token usage counters from Gemini
     std::string feedbackStatus;   // "pending" | "correct" | "wrong"
     bool        corrected;        // true once /feedback wrong has been applied
     std::string severity;         // "low" | "medium" | "high" | "" (empty if unset)
