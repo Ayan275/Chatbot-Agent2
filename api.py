@@ -358,19 +358,15 @@ def _save_runtime_state(user_query: str, bot_response: str) -> None:
 # ===========================================================================
 
 # Keep model selection on currently active generateContent models.
-DEFAULT_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
-SUPPORTED_MODELS = frozenset({
-    "gemini-3.1-pro-preview",
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-})
+SUPPORTED_MODELS = frozenset({"gemini-3.5-flash-lite", "gemini-3.1-pro-preview"})
 
 _configured_fallbacks = [
     model.strip()
     for model in os.getenv(
         "GEMINI_FALLBACKS",
-        "gemini-3.5-flash,gemini-3.5-flash-lite",
+        "gemini-3.5-flash-lite,gemini-3.1-pro-preview",
     ).split(",")
     if model.strip()
 ]
@@ -429,7 +425,10 @@ def _media_bytes(data: object, mime: str) -> bytes:
             raise BridgeError(f"Unsupported PIL image MIME type: {normalized_mime or '(empty)'}")
         image_buffer = io.BytesIO()
         try:
-            data.save(image_buffer, format=image_format)
+            image = data
+            if image_format == "JPEG" and image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+            image.save(image_buffer, format=image_format)
         except Exception as exc:
             raise BridgeError("PIL image could not be encoded for Gemini.") from exc
         payload = image_buffer.getvalue()

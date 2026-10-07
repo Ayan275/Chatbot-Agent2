@@ -192,6 +192,15 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
             self.assertEqual(decoded.size, (2, 2))
             self.assertEqual(decoded.getpixel((0, 0)), (128, 0, 128))
 
+    def test_media_part_converts_alpha_pil_images_for_jpeg(self) -> None:
+        image = Image.new("RGBA", (2, 2), color=(255, 0, 0, 128))
+
+        media = api.media_part(image, "image/jpeg")
+
+        with Image.open(io.BytesIO(base64.b64decode(media["inline_data"]["data"]))) as decoded:
+            self.assertEqual(decoded.mode, "RGB")
+            self.assertEqual(decoded.size, (2, 2))
+
     def test_model_picker_uses_active_model_for_retired_overrides(self) -> None:
         for retired_model in ("gemini-2.0-flash", "gemini-3.8-flash", "not-a-gemini-model"):
             with self.subTest(model=retired_model), patch.dict(os.environ, {"GEMINI_MODEL": retired_model}):
@@ -200,13 +209,15 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
     def test_gemini_models_and_fallbacks_use_active_allowlist(self) -> None:
         active_models = {
             "gemini-3.1-pro-preview",
-            "gemini-3.5-flash",
             "gemini-3.5-flash-lite",
         }
 
-        self.assertEqual(api.DEFAULT_MODEL, "gemini-3.1-pro-preview")
+        self.assertEqual(api.DEFAULT_MODEL, "gemini-3.5-flash-lite")
         self.assertEqual(api.SUPPORTED_MODELS, active_models)
-        self.assertLessEqual(set(api.FALLBACK_MODELS), active_models)
+        self.assertEqual(
+            api.FALLBACK_MODELS,
+            ["gemini-3.5-flash-lite", "gemini-3.1-pro-preview"],
+        )
 
     def test_whatsapp_state_round_trips_atomically(self) -> None:
         state_path = Path(self.temp_dir.name) / "wa_state.json"
@@ -247,9 +258,15 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
         metadata = MetadataResponse()
         media = MediaResponse([b"ab", b"c"])
         with patch.object(whatsapp_agent, "api_call", return_value=metadata), \
-             patch.object(whatsapp_agent.HTTP, "get", return_value=media):
+             patch.object(whatsapp_agent.HTTP, "get", return_value=media) as get_media:
             payload, mime = whatsapp_agent.download("media-id")
         self.assertEqual((payload, mime), (b"abc", "audio/ogg"))
+        get_media.assert_called_once_with(
+            "https://media.example.test/item",
+            headers=whatsapp_agent.HDR,
+            timeout=30,
+            stream=True,
+        )
         self.assertTrue(media.closed)
 
         oversized = MediaResponse([b"unused"])
@@ -274,17 +291,20 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
         image_bytes = image_buffer.getvalue()
 
         with patch.dict(os.environ, {"GEMINI_MODEL": ""}):
-            self.assertEqual(api._pick_model(whatsapp_agent.cfg_model()), "gemini-2.5-flash")
+            self.assertEqual(api._pick_model(whatsapp_agent.cfg_model()), api.DEFAULT_MODEL)
 
         with patch.object(api, "_call_gemini", return_value=("A blue image.", {})) as call:
-            result = whatsapp_agent.digest("image", image_bytes, "IMAGE/JPEG; charset=binary")
+            result = whatsapp_agent.digest(
+                "image", image_bytes, "IMAGE/JPEG; charset=binary", text="What color is it?"
+            )
 
         self.assertEqual(result, "A blue image.")
         contents = call.call_args.args[2]
         parts = contents[0]["parts"]
-        self.assertIn("Describe this image", parts[0]["text"])
+        self.assertEqual(parts[0]["text"], "What color is it?")
         self.assertEqual(parts[1]["inline_data"]["mime_type"], "image/jpeg")
-        self.assertEqual(base64.b64decode(parts[1]["inline_data"]["data"]), image_bytes)
+        with Image.open(io.BytesIO(base64.b64decode(parts[1]["inline_data"]["data"]))) as decoded:
+            self.assertEqual(decoded.size, (2, 2))
 
     def test_gemini_generate_uses_v1beta_model_and_multipart_json(self) -> None:
         image_buffer = io.BytesIO()
@@ -302,7 +322,7 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
              patch.object(api, "_save_think_cache"), \
              patch.object(api.requests, "post", return_value=SuccessfulResponse()) as post:
             api._generate(
-                "gemini-2.5-flash",
+                "gemini-3.5-flash-lite",
                 "test-key",
                 "",
                 [{"role": "user", "parts": [{"text": "Describe this image."}, media, audio]}],
@@ -314,7 +334,7 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertEqual(
             url,
-            f"{api.GEMINI_URL}/models/gemini-2.5-flash:generateContent",
+            f"{api.GEMINI_URL}/models/gemini-3.5-flash-lite:generateContent",
         )
         self.assertEqual(post.call_args.kwargs["headers"]["x-goog-api-key"], "test-key")
         parts = payload["contents"][0]["parts"]

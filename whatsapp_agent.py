@@ -19,6 +19,7 @@ Disabled over WhatsApp: /exit, exit, /changepassword (they need the terminal).
 import os, io, re, json, time, queue, asyncio, logging, tempfile, threading, subprocess
 import hashlib, secrets
 from pathlib import Path
+from PIL import Image
 import requests, edge_tts
 from correction_utils import atomic_write_json
 
@@ -421,10 +422,15 @@ def digest(kind: str, data: bytes | str | os.PathLike | None = None,
             mime = (mime or "image/jpeg").split(";", 1)[0].strip().lower()
             if not mime.lower().startswith("image/"):
                 raise ValueError("Image payload has an invalid MIME type.")
-            ask = ("Describe this image concisely: what it shows, any visible text, and key details. "
-                   "Plain text only, no markdown, at most 800 characters.")
-            image = gemini.media_part(data, mime)
-            return gem([{"text": ask}, image], MEDIA_BUDGET)
+            if not isinstance(data, (bytes, bytearray, memoryview)):
+                raise ValueError("Image payload must be downloaded image bytes.")
+            ask = (text.strip() if isinstance(text, str) and text.strip()
+                   else "Analyze this image in detail.")
+            with Image.open(io.BytesIO(bytes(data))) as source:
+                source.load()
+                image = source.copy()
+            image_part = gemini.media_part(image, mime)
+            return gem([{"text": ask}, image_part], MEDIA_BUDGET)
         else:
             ask = ("Summarise this document: topic, key points, important numbers, names and dates. "
                    "Plain text only, no markdown, at most 1000 characters.")
@@ -433,6 +439,7 @@ def digest(kind: str, data: bytes | str | os.PathLike | None = None,
         return gem([first, {"text": ask}], MEDIA_BUDGET)
     except Exception as exc:
         if kind == "image":
+            log.exception("Gemini image processing failed (mime=%s)", mime)
             raise RuntimeError("Image payload could not be prepared or sent to Gemini Vision.") from exc
         raise
 
@@ -501,10 +508,10 @@ def handle(msg):
         try:
             data, mime = download(msg["image"]["id"])
             cap = safe(msg["image"].get("caption") or "Is image ki summary do", 300)
-            desc = safe(digest("image", data, mime or "image/jpeg"), 1500)
+            desc = safe(digest("image", data, mime or "image/jpeg", text=cap), 1500)
             line = safe(f"{cap} [Attached image: {desc}]")
         except Exception as e:
-            log.error("image processing failed: %s", e)
+            log.exception("image processing failed for media_id=%s: %s", msg["image"].get("id"), e)
             send_text(to, "Image process nahi ho saki. Dobara bhejo ya text mein batao.")
             return
 
