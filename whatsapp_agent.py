@@ -611,6 +611,7 @@ def main():
                 continue
 
             if r.status_code == 204:
+                time.sleep(1)
                 continue
             if r.status_code == 409:
                 log.error("Another poller is running for this agent. Stop the other one.")
@@ -636,7 +637,8 @@ def main():
                 time.sleep(5)
                 continue
 
-            for entry in data.get("entry", []):
+            entries = data.get("entry", [])
+            for entry in entries:
                 if not isinstance(entry, dict):
                     continue
                 changes = entry.get("changes", [])
@@ -668,6 +670,8 @@ def main():
 
             st["offset"] = next_offset
             save_state(st)
+            if not entries:
+                time.sleep(1)
     finally:
         bot.close()
 

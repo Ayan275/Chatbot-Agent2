@@ -219,6 +219,43 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
             ["gemini-3.5-flash-lite", "gemini-3.1-pro-preview"],
         )
 
+    def test_gemini_rate_limits_retry_then_rotate_to_pro_fallback(self) -> None:
+        class Response:
+            def __init__(self, status_code: int, payload: dict | None = None) -> None:
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 300
+                self.text = "rate limited" if status_code == 429 else ""
+                self.payload = payload or {}
+
+            def json(self) -> dict:
+                return self.payload
+
+        success = Response(200, {
+            "candidates": [{"content": {"parts": [{"text": "fallback reply"}]}}],
+            "usageMetadata": {},
+        })
+        responses = [Response(429), Response(429), Response(429), Response(429), success]
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}), \
+             patch.object(api, "FALLBACK_MODELS", []), \
+             patch.object(api, "_load_think_cache", return_value={}), \
+             patch.object(api, "_save_think_cache"), \
+             patch.object(api.requests, "post", side_effect=responses) as post, \
+             patch.object(api.time, "sleep") as sleep:
+            text, _ = api._call_gemini(
+                api.DEFAULT_MODEL,
+                "",
+                [{"role": "user", "parts": [{"text": "Hello"}]}],
+            )
+
+        self.assertEqual(text, "fallback reply")
+        self.assertEqual([call.args[0] for call in post.call_args_list], [
+            f"{api.GEMINI_URL}/models/{api.DEFAULT_MODEL}:generateContent",
+        ] * 4 + [
+            f"{api.GEMINI_URL}/models/{api.RATE_LIMIT_FALLBACK_MODEL}:generateContent",
+        ])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4, 4])
+
     def test_whatsapp_state_round_trips_atomically(self) -> None:
         state_path = Path(self.temp_dir.name) / "wa_state.json"
         with patch.object(whatsapp_agent, "STATE_FILE", state_path):

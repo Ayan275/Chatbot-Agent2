@@ -361,6 +361,7 @@ def _save_runtime_state(user_query: str, bot_response: str) -> None:
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 SUPPORTED_MODELS = frozenset({"gemini-3.5-flash-lite", "gemini-3.1-pro-preview"})
+RATE_LIMIT_FALLBACK_MODEL = "gemini-3.1-pro-preview"
 
 _configured_fallbacks = [
     model.strip()
@@ -586,7 +587,7 @@ def _generate(model: str, key: str, system: str, contents: list, temperature: fl
 
 def _call_gemini(model: str, system: str, contents: list, temperature: float = 0.1,
                  budget_s: float = 15.0) -> tuple[str, dict]:
-    """Call Gemini with 503-retry and automatic model fallback. Returns (text, usage)."""
+    """Call Gemini with rate-limit backoff and automatic model fallback."""
     if requests is None:
         raise BridgeError("requests module not installed (run: python -m pip install requests)")
     key = os.getenv("GEMINI_API_KEY")
@@ -601,10 +602,17 @@ def _call_gemini(model: str, system: str, contents: list, temperature: float = 0
     deadline = t0 + budget_s
     last_msg = None
 
-    for name in [model] + [m for m in FALLBACK_MODELS if m != model]:
-        for attempt in range(2):
+    model_order = [model] + [m for m in FALLBACK_MODELS if m != model]
+    if RATE_LIMIT_FALLBACK_MODEL != model and RATE_LIMIT_FALLBACK_MODEL not in model_order:
+        model_order.append(RATE_LIMIT_FALLBACK_MODEL)
+
+    for name in model_order:
+        rate_limit_retries = 0
+        server_retries = 0
+        attempt = 0
+        while True:
             remaining = deadline - time.monotonic()
-            if remaining < 3:
+            if remaining <= 0.5:
                 break
             try:
                 r = _generate(name, key, system, contents, temperature, remaining)
@@ -647,14 +655,30 @@ def _call_gemini(model: str, system: str, contents: list, temperature: float = 0
                          usage["total_tokens"], "" if name == model else " [FALLBACK]")
                 return text, usage
 
-            log.warning("[Gemini] %s attempt %d -> HTTP %s: %s", name, attempt + 1, r.status_code, r.text[:200])
+            attempt += 1
+            log.warning("[Gemini] %s attempt %d -> HTTP %s: %s", name, attempt, r.status_code, r.text[:200])
             last_msg = _friendly_status(r.status_code, r.text)
             if r.status_code in (401, 403) or "api_key_invalid" in r.text.lower():
                 raise BridgeError(last_msg)         # no point trying other models with a bad key
+            if r.status_code == 429:
+                if rate_limit_retries >= 3:
+                    log.warning("[Gemini] %s rate-limit retries exhausted; rotating models", name)
+                    break
+                wait = min(2 ** (rate_limit_retries + 1), 4)
+                if time.monotonic() + wait >= deadline:
+                    log.warning("[Gemini] %s rate-limit retry would exceed the request deadline", name)
+                    break
+                rate_limit_retries += 1
+                log.warning("[Gemini] %s rate limited; retry %d/3 in %ss",
+                            name, rate_limit_retries, wait)
+                time.sleep(wait)
+                continue
             if r.status_code in (500, 502, 503, 504):
-                time.sleep(0.25)
-                continue                            # temporary overload: retry once
-            break                                   # 404 / 429 / other: next model
+                if server_retries == 0:
+                    server_retries += 1
+                    time.sleep(0.25)
+                    continue                        # temporary overload: retry once
+            break                                   # rotate models on other failures
 
     raise BridgeError(last_msg or "Gemini request could not be completed.")
 
