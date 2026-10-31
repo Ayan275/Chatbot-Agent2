@@ -553,13 +553,13 @@ def _thinking_variants(model: str) -> list:
 
 
 def _gemini_api_keys() -> list[str]:
-    """Return configured Gemini keys in priority order, without duplicates."""
-    configured = os.getenv("GEMINI_API_KEYS", "")
-    keys = [key.strip() for key in configured.split(",") if key.strip()]
+    """Return configured Gemini keys, preferring the multi-key setting when present."""
+    if "GEMINI_API_KEYS" in os.environ:
+        configured = os.environ["GEMINI_API_KEYS"]
+        return [key.strip() for key in configured.split(",") if key.strip()]
+
     legacy_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if legacy_key and legacy_key not in keys:
-        keys.append(legacy_key)
-    return keys
+    return [legacy_key] if legacy_key else []
 
 
 def _next_gemini_key_index(key_count: int) -> int:
@@ -798,9 +798,10 @@ def _call_gemini(model: str, system: str, contents: list, temperature: float = 0
         raise BridgeError("requests module not installed (run: python -m pip install requests)")
     keys = _gemini_api_keys()
     if not keys:
+        log.error("No Gemini API key configured (set GEMINI_API_KEYS or GEMINI_API_KEY).")
         if os.getenv("OPENROUTER_API_KEY", "").strip():
             return _call_openrouter(system, contents, temperature, budget_s)
-        raise BridgeError("Set GEMINI_API_KEYS or GEMINI_API_KEY to enable the AI service.")
+        raise BridgeError("AI service is not configured. Please try again later.")
 
     budget_s = min(budget_s, 15.0)
     t0 = time.monotonic()
