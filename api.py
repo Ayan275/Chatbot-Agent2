@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -52,6 +53,11 @@ try:
     import fcntl
 except ImportError:  # Windows does not expose fcntl
     fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:  # POSIX does not expose msvcrt
+    msvcrt = None  # type: ignore[assignment]
 
 from correction_utils import atomic_write_json, build_negative_constraint, compute_match_score, extract_keywords, keyword_match
 
@@ -102,13 +108,18 @@ def _locked_read(handle):
         return
 
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        _apply_fcntl_lock(handle, "LOCK_SH")
         yield handle
     finally:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _apply_fcntl_lock(handle, "LOCK_UN")
         except OSError:
             pass
+
+
+def _apply_fcntl_lock(handle, operation: str) -> None:
+    if fcntl is not None:
+        getattr(fcntl, "flock")(handle.fileno(), getattr(fcntl, operation))
 
 
 def _load_corrections_payload() -> dict[str, str]:
@@ -376,6 +387,15 @@ for _invalid_model in set(_configured_fallbacks) - SUPPORTED_MODELS:
     log.warning("[Gemini] Ignoring unsupported fallback model %r", _invalid_model)
 GEMINI_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
 THINK_CACHE_PATH: Path = BASE_DIR / "gemini_thinking.json"   # remembers which thinking setting each model accepts
+GEMINI_KEY_ROTATION_PATH: Path = BASE_DIR / "gemini_key_rotation.txt"
+GEMINI_KEY_ROTATION_LOCK_PATH: Path = BASE_DIR / "gemini_key_rotation.lock"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODELS = (
+    "google/gemini-flash-1.5",
+    "meta-llama/llama-3.2-11b-vision-instruct:free",
+)
+_KEY_ROTATION_LOCK = threading.Lock()
+_KEY_ROTATION_INDEX = 0
 
 
 class BridgeError(Exception):
@@ -503,7 +523,7 @@ def _to_gemini(messages: list[dict], media_parts=None):
 def _friendly_status(status: int, body: str) -> str:
     low = body.lower()
     if status in (401, 403) or "api_key_invalid" in low or "api key not valid" in low:
-        return "Authentication failed. Check GEMINI_API_KEY."
+        return "Authentication failed. Check GEMINI_API_KEYS or GEMINI_API_KEY."
     if status == 429:
         return "API rate limit exceeded. Please try again later."
     if status in (500, 502, 503, 504):
@@ -525,13 +545,195 @@ def _thinking_variants(model: str) -> list:
     if os.getenv("GEMINI_THINKING", "").lower() == "default":
         return [None]
     m = model.lower()
-    # All flash variants: disable thinking — saves 2-4s per call.
     if "flash" in m:
         return [{"thinkingBudget": 0}, None]
-    # Pro/experimental models: try minimal thinking first, then model default.
     if "2.5" in m or "2.0" in m or "pro" in m:
         return [{"thinkingBudget": 0}, None]
     return [None]
+
+
+def _gemini_api_keys() -> list[str]:
+    """Return configured Gemini keys in priority order, without duplicates."""
+    configured = os.getenv("GEMINI_API_KEYS", "")
+    keys = [key.strip() for key in configured.split(",") if key.strip()]
+    legacy_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if legacy_key and legacy_key not in keys:
+        keys.append(legacy_key)
+    return keys
+
+
+def _next_gemini_key_index(key_count: int) -> int:
+    """Persist the round-robin start key across the one-process-per-turn bridge."""
+    global _KEY_ROTATION_INDEX
+    if key_count <= 1:
+        return 0
+
+    with _KEY_ROTATION_LOCK:
+        try:
+            with GEMINI_KEY_ROTATION_LOCK_PATH.open("a+b") as lock_file:
+                if fcntl is not None:
+                    _apply_fcntl_lock(lock_file, "LOCK_EX")
+                elif msvcrt is not None:
+                    lock_file.seek(0, os.SEEK_END)
+                    if lock_file.tell() == 0:
+                        lock_file.write(b"\0")
+                        lock_file.flush()
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+
+                try:
+                    try:
+                        current = int(GEMINI_KEY_ROTATION_PATH.read_text(encoding="ascii").strip())
+                    except (FileNotFoundError, ValueError):
+                        current = _KEY_ROTATION_INDEX
+                    selected = current % key_count
+                    next_index = (selected + 1) % key_count
+                    GEMINI_KEY_ROTATION_PATH.write_text(str(next_index), encoding="ascii")
+                    _KEY_ROTATION_INDEX = next_index
+                    return selected
+                finally:
+                    if fcntl is not None:
+                        _apply_fcntl_lock(lock_file, "LOCK_UN")
+                    elif msvcrt is not None:
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError as exc:
+            log.warning("[Gemini] Could not persist API-key rotation: %s", type(exc).__name__)
+            selected = _KEY_ROTATION_INDEX % key_count
+            _KEY_ROTATION_INDEX = (selected + 1) % key_count
+            return selected
+
+
+def _is_quota_limit(status: int, body: str) -> bool:
+    """Recognize Gemini rate limits and quota exhaustion responses."""
+    if status == 429:
+        return True
+    if status not in (400, 403):
+        return False
+    lowered = body.lower()
+    return any(marker in lowered for marker in ("quota", "resource_exhausted", "rate limit"))
+
+
+def _openrouter_messages(system: str, contents: list) -> list[dict]:
+    """Convert Gemini content parts to OpenAI-compatible OpenRouter messages."""
+    messages: list[dict] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+
+    for turn in contents:
+        role = "assistant" if turn.get("role") == "model" else "user"
+        parts = turn.get("parts") or []
+        text_parts = [part["text"] for part in parts
+                      if isinstance(part, dict) and isinstance(part.get("text"), str)]
+        media_parts = [part["inline_data"] for part in parts
+                       if isinstance(part, dict) and isinstance(part.get("inline_data"), dict)]
+        if not media_parts:
+            messages.append({"role": role, "content": "\n".join(text_parts)})
+            continue
+
+        content = [{"type": "text", "text": text} for text in text_parts]
+        for media in media_parts:
+            mime = media.get("mime_type")
+            encoded = media.get("data")
+            if not isinstance(mime, str) or not isinstance(encoded, str):
+                raise BridgeError("Media payload could not be prepared for fallback.")
+            if mime.startswith("image/"):
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{encoded}"},
+                })
+            elif mime.startswith("audio/"):
+                audio_format = {
+                    "audio/ogg": "ogg",
+                    "audio/opus": "ogg",
+                    "audio/mpeg": "mp3",
+                    "audio/mp3": "mp3",
+                    "audio/wav": "wav",
+                    "audio/x-wav": "wav",
+                    "audio/flac": "flac",
+                    "audio/aac": "aac",
+                }.get(mime)
+                if audio_format is None:
+                    raise BridgeError("Unsupported audio type for fallback.")
+                content.append({
+                    "type": "input_audio",
+                    "input_audio": {"data": encoded, "format": audio_format},
+                })
+            else:
+                raise BridgeError("Unsupported media type for fallback.")
+        messages.append({"role": role, "content": content})
+    return messages
+
+
+def _call_openrouter(system: str, contents: list, temperature: float,
+                     read_timeout: float) -> tuple[str, dict]:
+    """Execute the ultimate OpenRouter fallback with the same converted media."""
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        raise BridgeError("AI service is temporarily unavailable. Please try again later.")
+    if requests is None:
+        raise BridgeError("requests module not installed (run: python -m pip install requests)")
+
+    messages = _openrouter_messages(system, contents)
+    deadline = time.monotonic() + min(read_timeout, 15.0)
+    last_status = None
+    for model in OPENROUTER_MODELS:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.25:
+            break
+        connect_timeout = min(4.0, max(0.25, remaining / 3))
+        try:
+            response = requests.post(
+                OPENROUTER_URL,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": 512,
+                },
+                timeout=(connect_timeout, max(0.25, remaining - connect_timeout)),
+            )
+        except requests.exceptions.RequestException as exc:
+            log.warning("[OpenRouter] Request failed: %s", type(exc).__name__)
+            break
+
+        if response.ok:
+            try:
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid response shape")
+                choices = payload.get("choices") or []
+                message = choices[0].get("message") or {}
+                answer = message.get("content")
+                if isinstance(answer, list):
+                    answer = "".join(
+                        item.get("text", "") for item in answer
+                        if isinstance(item, dict) and isinstance(item.get("text"), str)
+                    )
+                if not isinstance(answer, str) or not answer.strip():
+                    raise ValueError("empty response content")
+            except (AttributeError, IndexError, TypeError, ValueError):
+                log.warning("[OpenRouter] %s returned an invalid response", model)
+                continue
+
+            usage_data = payload.get("usage")
+            if not isinstance(usage_data, dict):
+                usage_data = {}
+            usage = {
+                "prompt_tokens": int(usage_data.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage_data.get("completion_tokens") or 0),
+                "total_tokens": int(usage_data.get("total_tokens") or 0),
+            }
+            log.info("[OpenRouter] %s replied successfully", model)
+            return answer.strip(), usage
+
+        last_status = response.status_code
+        log.warning("[OpenRouter] %s returned HTTP %s", model, last_status)
+
+    if last_status is not None:
+        log.error("[OpenRouter] Fallback models failed (last HTTP %s)", last_status)
+    raise BridgeError("AI service is temporarily unavailable. Please try again later.")
 
 
 def _load_think_cache() -> dict:
@@ -551,6 +753,8 @@ def _save_think_cache(cache: dict) -> None:
 
 def _generate(model: str, key: str, system: str, contents: list, temperature: float, read_timeout: float):
     """One REST call (with thinking-variant negotiation). Returns the requests.Response."""
+    if requests is None:
+        raise BridgeError("requests module not installed (run: python -m pip install requests)")
     cache = _load_think_cache()
     cached_variant = cache.get(model)
     variants = [cached_variant] if cached_variant in (None, {"thinkingBudget": 0}) else _thinking_variants(model)
@@ -587,100 +791,98 @@ def _generate(model: str, key: str, system: str, contents: list, temperature: fl
 
 def _call_gemini(model: str, system: str, contents: list, temperature: float = 0.1,
                  budget_s: float = 15.0) -> tuple[str, dict]:
-    """Call Gemini with rate-limit backoff and automatic model fallback."""
+    """Rotate Gemini keys on quota limits, then use OpenRouter as the final fallback."""
+    if model != DEFAULT_MODEL:
+        log.info("[Gemini] Requested model ignored; using primary model %s", DEFAULT_MODEL)
     if requests is None:
         raise BridgeError("requests module not installed (run: python -m pip install requests)")
-    key = os.getenv("GEMINI_API_KEY")
-    if not key:
-        raise BridgeError("GEMINI_API_KEY environment variable not set")
-    if model not in SUPPORTED_MODELS:
-        log.warning("[Gemini] Replacing unsupported requested model %r with %s", model, DEFAULT_MODEL)
-        model = DEFAULT_MODEL
+    keys = _gemini_api_keys()
+    if not keys:
+        if os.getenv("OPENROUTER_API_KEY", "").strip():
+            return _call_openrouter(system, contents, temperature, budget_s)
+        raise BridgeError("Set GEMINI_API_KEYS or GEMINI_API_KEY to enable the AI service.")
 
     budget_s = min(budget_s, 15.0)
     t0 = time.monotonic()
     deadline = t0 + budget_s
-    last_msg = None
+    start_index = _next_gemini_key_index(len(keys))
+    ordered_keys = keys[start_index:] + keys[:start_index]
+    quota_limited_keys = 0
+    last_msg = "Gemini request could not be completed."
 
-    model_order = [model] + [m for m in FALLBACK_MODELS if m != model]
-    if RATE_LIMIT_FALLBACK_MODEL != model and RATE_LIMIT_FALLBACK_MODEL not in model_order:
-        model_order.append(RATE_LIMIT_FALLBACK_MODEL)
+    for index, key in enumerate(ordered_keys):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.5:
+            break
+        try:
+            response = _generate(DEFAULT_MODEL, key, system, contents, temperature, remaining)
+        except requests.exceptions.Timeout:
+            last_msg = "API Request Timed Out."
+            log.warning("[Gemini] Request timed out")
+            break
+        except requests.exceptions.ConnectionError:
+            raise BridgeError("No Internet Connection. Please check your network and try again.")
+        except requests.exceptions.RequestException as exc:
+            last_msg = f"Network error: {type(exc).__name__}."
+            log.warning("[Gemini] Request failed: %s", type(exc).__name__)
+            break
 
-    for name in model_order:
-        rate_limit_retries = 0
-        server_retries = 0
-        attempt = 0
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0.5:
-                break
+        if response is None:
+            last_msg = "Gemini request deadline expired before receiving a response."
+            break
+
+        if response.ok:
             try:
-                r = _generate(name, key, system, contents, temperature, remaining)
-            except requests.exceptions.Timeout:
-                last_msg = "API Request Timed Out."
-                log.warning("[Gemini] %s timed out", name)
+                payload = response.json()
+            except ValueError:
+                last_msg = "Invalid JSON response from API."
                 break
-            except requests.exceptions.ConnectionError:
-                raise BridgeError("No Internet Connection. Please check your network and try again.")
-            except requests.exceptions.RequestException as exc:
-                last_msg = f"Network error: {type(exc).__name__}."
+            block = (payload.get("promptFeedback") or {}).get("blockReason")
+            candidates = payload.get("candidates") or []
+            parts = ((candidates[0].get("content") or {}).get("parts") or []) if candidates else []
+            text = "".join(
+                part.get("text", "") for part in parts
+                if isinstance(part, dict) and not part.get("thought")
+            ).strip()
+            if not text:
+                last_msg = ("Gemini blocked this request (%s)." % block) if block else \
+                           "Gemini returned an empty reply."
+                log.warning("[Gemini] Empty response, block=%s", block)
                 break
+            usage_data = payload.get("usageMetadata") or {}
+            usage = {
+                "prompt_tokens": int(usage_data.get("promptTokenCount") or 0),
+                "completion_tokens": int(usage_data.get("candidatesTokenCount") or 0),
+                "total_tokens": int(usage_data.get("totalTokenCount") or 0),
+            }
+            log.info("[Gemini] Replied in %.1fs (tokens=%s)", time.monotonic() - t0,
+                     usage["total_tokens"])
+            return text, usage
 
-            if r is None:
-                last_msg = "Gemini request deadline expired before receiving a response."
-                break
+        status = response.status_code
+        body = response.text
+        log.warning("[Gemini] Key attempt returned HTTP %s", status)
+        last_msg = _friendly_status(status, body)
+        if _is_quota_limit(status, body):
+            quota_limited_keys += 1
+            if index < len(ordered_keys) - 1:
+                if time.monotonic() + 1.5 >= deadline:
+                    log.warning("[Gemini] Key rotation delay exceeds request deadline")
+                    break
+                time.sleep(1.5)
+            continue
+        if status in (401, 403) or "api_key_invalid" in body.lower():
+            continue
+        if status in (500, 502, 503, 504):
+            time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+        break
 
-            if r.ok:
-                try:
-                    j = r.json()
-                except ValueError:
-                    last_msg = "Invalid JSON response from API."
-                    break
-                block = (j.get("promptFeedback") or {}).get("blockReason")
-                cands = j.get("candidates") or []
-                parts = ((cands[0].get("content") or {}).get("parts") or []) if cands else []
-                text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
-                if not text:
-                    last_msg = ("Gemini blocked this request (%s)." % block) if block else \
-                               "Gemini returned an empty reply."
-                    log.warning("[Gemini] %s empty reply, block=%s", name, block)
-                    break
-                um = j.get("usageMetadata") or {}
-                usage = {
-                    "prompt_tokens":     int(um.get("promptTokenCount") or 0),
-                    "completion_tokens": int(um.get("candidatesTokenCount") or 0),
-                    "total_tokens":      int(um.get("totalTokenCount") or 0),
-                }
-                log.info("[Gemini] %s replied in %.1fs (tokens=%s)%s", name, time.monotonic() - t0,
-                         usage["total_tokens"], "" if name == model else " [FALLBACK]")
-                return text, usage
-
-            attempt += 1
-            log.warning("[Gemini] %s attempt %d -> HTTP %s: %s", name, attempt, r.status_code, r.text[:200])
-            last_msg = _friendly_status(r.status_code, r.text)
-            if r.status_code in (401, 403) or "api_key_invalid" in r.text.lower():
-                raise BridgeError(last_msg)         # no point trying other models with a bad key
-            if r.status_code == 429:
-                if rate_limit_retries >= 3:
-                    log.warning("[Gemini] %s rate-limit retries exhausted; rotating models", name)
-                    break
-                wait = min(2 ** (rate_limit_retries + 1), 4)
-                if time.monotonic() + wait >= deadline:
-                    log.warning("[Gemini] %s rate-limit retry would exceed the request deadline", name)
-                    break
-                rate_limit_retries += 1
-                log.warning("[Gemini] %s rate limited; retry %d/3 in %ss",
-                            name, rate_limit_retries, wait)
-                time.sleep(wait)
-                continue
-            if r.status_code in (500, 502, 503, 504):
-                if server_retries == 0:
-                    server_retries += 1
-                    time.sleep(0.25)
-                    continue                        # temporary overload: retry once
-            break                                   # rotate models on other failures
-
-    raise BridgeError(last_msg or "Gemini request could not be completed.")
+    if quota_limited_keys == len(keys) and os.getenv("OPENROUTER_API_KEY", "").strip():
+        log.info("[API] Gemini keys exhausted; using OpenRouter fallback")
+        return _call_openrouter(system, contents, temperature, max(0.5, deadline - time.monotonic()))
+    if quota_limited_keys == len(keys):
+        last_msg = "API rate limit exceeded. Please try again later."
+    raise BridgeError(last_msg)
 
 
 def run_turn(messages: list[dict], model: Optional[str] = None, media_parts=None,
@@ -718,7 +920,10 @@ def run_turn(messages: list[dict], model: Optional[str] = None, media_parts=None
     else:
         log.warning("[Correction] Could not extract user query - skipping correction lookup.")
 
-    chosen = _pick_model(model)
+    requested_model = _pick_model(model)
+    chosen = DEFAULT_MODEL
+    if requested_model != chosen:
+        log.info("[API] Requested model ignored; using primary model %s", chosen)
     system, contents = _to_gemini(messages, media_parts)
     log.info("[API] Sending to Gemini - model=%s messages=%d constraint=%s media=%d",
              chosen, len(messages), constraint_applied, len(media_parts or []))

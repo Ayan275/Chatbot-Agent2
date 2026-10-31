@@ -59,6 +59,8 @@ response_*.json
 /runtime_state.json
 /wa_state.json
 /gemini_thinking.json
+/gemini_key_rotation.txt
+/gemini_key_rotation.lock
 /audit_logs/*.jsonl
 
 # ─── Log Files ────────────────────────────────────────────────

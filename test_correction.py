@@ -219,7 +219,7 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
             ["gemini-3.5-flash-lite", "gemini-3.1-pro-preview"],
         )
 
-    def test_gemini_rate_limits_retry_then_rotate_to_pro_fallback(self) -> None:
+    def test_gemini_rate_limit_rotates_key_after_1_5_seconds(self) -> None:
         class Response:
             def __init__(self, status_code: int, payload: dict | None = None) -> None:
                 self.status_code = status_code
@@ -231,30 +231,95 @@ class SelfCorrectionIntegrationTests(unittest.TestCase):
                 return self.payload
 
         success = Response(200, {
-            "candidates": [{"content": {"parts": [{"text": "fallback reply"}]}}],
+            "candidates": [{"content": {"parts": [{"text": "rotated reply"}]}}],
             "usageMetadata": {},
         })
-        responses = [Response(429), Response(429), Response(429), Response(429), success]
+        rotation_path = Path(self.temp_dir.name) / "key_rotation.txt"
+        lock_path = Path(self.temp_dir.name) / "key_rotation.lock"
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}), \
-             patch.object(api, "FALLBACK_MODELS", []), \
-             patch.object(api, "_load_think_cache", return_value={}), \
-             patch.object(api, "_save_think_cache"), \
-             patch.object(api.requests, "post", side_effect=responses) as post, \
+        with patch.dict(os.environ, {
+                 "GEMINI_API_KEYS": "key-one,key-two",
+                 "GEMINI_API_KEY": "",
+                 "OPENROUTER_API_KEY": "",
+             }), \
+             patch.object(api, "GEMINI_KEY_ROTATION_PATH", rotation_path), \
+             patch.object(api, "GEMINI_KEY_ROTATION_LOCK_PATH", lock_path), \
+             patch.object(api, "_KEY_ROTATION_INDEX", 0), \
+             patch.object(api, "_generate", side_effect=[Response(429), success, success]) as generate, \
              patch.object(api.time, "sleep") as sleep:
             text, _ = api._call_gemini(
                 api.DEFAULT_MODEL,
                 "",
                 [{"role": "user", "parts": [{"text": "Hello"}]}],
             )
+            next_request_text, _ = api._call_gemini(
+                api.DEFAULT_MODEL,
+                "",
+                [{"role": "user", "parts": [{"text": "Another request"}]}],
+            )
 
-        self.assertEqual(text, "fallback reply")
-        self.assertEqual([call.args[0] for call in post.call_args_list], [
-            f"{api.GEMINI_URL}/models/{api.DEFAULT_MODEL}:generateContent",
-        ] * 4 + [
-            f"{api.GEMINI_URL}/models/{api.RATE_LIMIT_FALLBACK_MODEL}:generateContent",
-        ])
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4, 4])
+        self.assertEqual(text, "rotated reply")
+        self.assertEqual(next_request_text, "rotated reply")
+        self.assertEqual(
+            [call.args[1] for call in generate.call_args_list],
+            ["key-one", "key-two", "key-two"],
+        )
+        self.assertTrue(all(call.args[0] == "gemini-3.5-flash-lite" for call in generate.call_args_list))
+        sleep.assert_called_once_with(1.5)
+
+    def test_all_gemini_quota_limits_use_openrouter_with_encoded_media(self) -> None:
+        class GeminiResponse:
+            status_code = 429
+            ok = False
+            text = "rate limited"
+
+        class OpenRouterResponse:
+            status_code = 200
+            ok = True
+
+            @staticmethod
+            def json() -> dict:
+                return {
+                    "choices": [{"message": {"content": "OpenRouter reply"}}],
+                    "usage": {"prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11},
+                }
+
+        image = Image.new("RGB", (2, 2), color="blue")
+        image_part = api.media_part(image, "image/jpeg")
+        audio_part = api.media_part(b"sample audio", "audio/ogg")
+        contents = [{
+            "role": "user",
+            "parts": [
+                {"text": "Describe these media."},
+                image_part,
+                audio_part,
+            ],
+        }]
+        rotation_path = Path(self.temp_dir.name) / "key_rotation.txt"
+        lock_path = Path(self.temp_dir.name) / "key_rotation.lock"
+
+        with patch.dict(os.environ, {
+                 "GEMINI_API_KEYS": "key-one,key-two",
+                 "GEMINI_API_KEY": "",
+                 "OPENROUTER_API_KEY": "openrouter-test-key",
+             }), \
+             patch.object(api, "GEMINI_KEY_ROTATION_PATH", rotation_path), \
+             patch.object(api, "GEMINI_KEY_ROTATION_LOCK_PATH", lock_path), \
+             patch.object(api, "_KEY_ROTATION_INDEX", 0), \
+             patch.object(api, "_generate", return_value=GeminiResponse()), \
+             patch.object(api.requests, "post", return_value=OpenRouterResponse()) as post, \
+             patch.object(api.time, "sleep"):
+            text, usage = api._call_gemini(api.DEFAULT_MODEL, "Be concise.", contents)
+
+        request = post.call_args.kwargs
+        self.assertEqual(request["headers"]["Authorization"], "Bearer openrouter-test-key")
+        self.assertEqual(request["json"]["model"], "google/gemini-flash-1.5")
+        self.assertEqual(text, "OpenRouter reply")
+        self.assertEqual(usage["total_tokens"], 11)
+        converted = request["json"]["messages"][-1]["content"]
+        self.assertTrue(converted[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(base64.b64decode(converted[2]["input_audio"]["data"]), b"sample audio")
+        self.assertEqual(converted[2]["input_audio"]["format"], "ogg")
 
     def test_whatsapp_state_round_trips_atomically(self) -> None:
         state_path = Path(self.temp_dir.name) / "wa_state.json"

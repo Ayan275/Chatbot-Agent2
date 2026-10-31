@@ -12,7 +12,8 @@ Gemini is used only as "ears and eyes":
 
 Keep this file in the project root next to api.py and the C++ chatbot binary, then run:
     python whatsapp_agent.py
-Env vars: WA_AGENT_TOKEN, GEMINI_API_KEY, CHATBOT_USER (needed if users.json has several users)
+Env vars: WA_AGENT_TOKEN, GEMINI_API_KEYS (or GEMINI_API_KEY), CHATBOT_USER (needed if users.json has several users)
+Optional ultimate API fallback: OPENROUTER_API_KEY.
 Optional: CHATBOT_EXE (full path to chatbot binary), GEMINI_MODEL
 Disabled over WhatsApp: /exit, exit, /changepassword (they need the terminal).
 """
@@ -439,7 +440,7 @@ def digest(kind: str, data: bytes | str | os.PathLike | None = None,
         return gem([first, {"text": ask}], MEDIA_BUDGET)
     except Exception as exc:
         if kind == "image":
-            log.exception("Gemini image processing failed (mime=%s)", mime)
+            log.error("Image processing failed (mime=%s, error=%s)", mime, type(exc).__name__)
             raise RuntimeError("Image payload could not be prepared or sent to Gemini Vision.") from exc
         raise
 
@@ -495,7 +496,7 @@ def handle(msg):
             data, mime = download(msg["audio"]["id"])
             heard = safe(transcribe(data, mime))
         except Exception as e:
-            log.error("audio processing failed: %s", e)
+            log.error("Audio processing failed: %s", type(e).__name__)
             send_text(to, "Awaaz process nahi ho saki. Dobara try karo.")
             return
         log.info("transcript: %s", heard)
@@ -511,7 +512,8 @@ def handle(msg):
             desc = safe(digest("image", data, mime or "image/jpeg", text=cap), 1500)
             line = safe(f"{cap} [Attached image: {desc}]")
         except Exception as e:
-            log.exception("image processing failed for media_id=%s: %s", msg["image"].get("id"), e)
+            log.error("Image processing failed for media_id=%s: %s",
+                      msg["image"].get("id"), type(e).__name__)
             send_text(to, "Image process nahi ho saki. Dobara bhejo ya text mein batao.")
             return
 

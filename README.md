@@ -58,7 +58,8 @@ runtime rather than embedded in the image:
 docker build -t whatsapp-ai-agent .
 docker run --name whatsapp-bot \
   -e WA_AGENT_TOKEN \
-  -e GEMINI_API_KEY \
+  -e GEMINI_API_KEYS \
+  -e OPENROUTER_API_KEY \
   -e CHATBOT_USER=Ayan \
   whatsapp-ai-agent
 ```
@@ -68,7 +69,9 @@ The image builds the C++ chatbot with CMake/GCC and launches it through
 `/app/chatbot_linux`.
 
 Railway can deploy this worker from the repository Dockerfile. Configure
-`WA_AGENT_TOKEN` and `GEMINI_API_KEY` as service variables; `CHATBOT_USER`
+`WA_AGENT_TOKEN` and `GEMINI_API_KEYS` as service variables; `OPENROUTER_API_KEY`
+is optional and provides the ultimate fallback. `GEMINI_API_KEY` remains supported
+for a single Gemini key. `CHATBOT_USER`
 defaults to `Ayan`. The worker does not expose an HTTP port. Runtime user,
 correction, audit, and WhatsApp offset state are stored under `/app`; they are
 not durable across container replacement. Persistent-volume path support is
@@ -87,18 +90,22 @@ python -m pip install -r requirements.txt
 
 ## API Key Setup
 
-This project uses the [Gemini API](https://ai.google.dev/gemini-api/docs). Set your key as an environment variable before running:
+This project uses the [Gemini API](https://ai.google.dev/gemini-api/docs). Configure one or more Gemini keys as environment variables before running. Keys in `GEMINI_API_KEYS` are comma-separated; the legacy single-key `GEMINI_API_KEY` remains supported. `OPENROUTER_API_KEY` is optional and is used when no Gemini key is configured or all Gemini keys are rate-limited or quota-exhausted.
 
 ```powershell
 # PowerShell (current session)
-$env:GEMINI_API_KEY = "your-gemini-api-key"
+$env:GEMINI_API_KEYS = "your-first-gemini-key,your-second-gemini-key"
+$env:OPENROUTER_API_KEY = "your-openrouter-api-key" # optional
 
 # PowerShell (permanent, user-level)
-[System.Environment]::SetEnvironmentVariable("GEMINI_API_KEY", "your-key", "User")
+[System.Environment]::SetEnvironmentVariable("GEMINI_API_KEYS", "your-first-key,your-second-key", "User")
 ```
 
-The default model is `gemini-3.5-flash-lite`. `GEMINI_MODEL` can select
-`gemini-3.1-pro-preview`; unsupported model names use the default.
+The primary model is `gemini-3.5-flash-lite`. Gemini API keys rotate between
+requests; a rate-limited key is followed by the next key after a 1.5-second
+delay. When all configured Gemini keys are quota-limited, the optional OpenRouter
+fallback tries `google/gemini-flash-1.5` and then
+`meta-llama/llama-3.2-11b-vision-instruct:free`.
 
 ---
 
